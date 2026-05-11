@@ -31,13 +31,15 @@ log = logging.getLogger("TradingBot")
 CT = ZoneInfo("America/Chicago")
 
 # ── Config (loaded from environment variables set in Railway) ──────────────────
-TRADOVATE_USER     = os.environ.get("TRADOVATE_USER", "")
-TRADOVATE_PASS     = os.environ.get("TRADOVATE_PASS", "")
-TRADOVATE_API_URL  = "https://demo.tradovateapi.com/v1"   # demo = paper trading
-CLAUDE_API_KEY     = os.environ.get("CLAUDE_API_KEY", "")
-GOOGLE_DRIVE_BRAIN = os.environ.get("GOOGLE_DRIVE_BRAIN_FOLDER_ID", "")
-PUSHOVER_TOKEN     = os.environ.get("PUSHOVER_TOKEN", "")   # phone alerts
-PUSHOVER_USER      = os.environ.get("PUSHOVER_USER", "")
+TRADOVATE_USER        = os.environ.get("TRADOVATE_USER", "")
+TRADOVATE_PASS        = os.environ.get("TRADOVATE_PASS", "")
+TRADOVATE_DEVICE_ID   = os.environ.get("TRADOVATE_DEVICE_ID", "trading-bot-001")
+TRADOVATE_ACCESS_TOKEN = os.environ.get("TRADOVATE_ACCESS_TOKEN", "")  # manual token option
+TRADOVATE_API_URL     = "https://demo.tradovateapi.com/v1"   # demo = paper trading
+CLAUDE_API_KEY        = os.environ.get("CLAUDE_API_KEY", "")
+GOOGLE_DRIVE_BRAIN    = os.environ.get("GOOGLE_DRIVE_BRAIN_FOLDER_ID", "")
+PUSHOVER_TOKEN        = os.environ.get("PUSHOVER_TOKEN", "")   # phone alerts
+PUSHOVER_USER         = os.environ.get("PUSHOVER_USER", "")
 
 # ── Risk Rules (matching master_rules.md) ──────────────────────────────────────
 MAX_TRADES_PER_DAY   = 5
@@ -77,28 +79,79 @@ state = {
 # ══════════════════════════════════════════════════════════════════════════════
 
 def tradovate_login():
-    """Authenticate with Tradovate demo API."""
+    """
+    Authenticate with Tradovate demo API.
+    Supports three methods in order of priority:
+    1. Manual access token (best for Google accounts)
+    2. Username + password (for regular accounts)
+    3. Graceful fallback with clear instructions
+    """
     log.info("Logging into Tradovate demo...")
-    try:
-        resp = requests.post(f"{TRADOVATE_API_URL}/auth/accesstokenrequest", json={
-            "name": TRADOVATE_USER,
-            "password": TRADOVATE_PASS,
-            "appId": "TradingBot",
-            "appVersion": "1.0",
-            "cid": 0,
-            "sec": ""
-        }, timeout=10)
-        data = resp.json()
-        if "accessToken" in data:
-            state["access_token"] = data["accessToken"]
-            log.info("✅ Tradovate login successful")
-            return True
-        else:
-            log.error(f"❌ Tradovate login failed: {data}")
-            return False
-    except Exception as e:
-        log.error(f"❌ Tradovate connection error: {e}")
-        return False
+
+    # Method 1: Use manually provided access token (Google OAuth accounts)
+    if TRADOVATE_ACCESS_TOKEN:
+        log.info("Using manual access token for Google account...")
+        state["access_token"] = TRADOVATE_ACCESS_TOKEN
+        # Verify the token works
+        try:
+            resp = requests.get(
+                f"{TRADOVATE_API_URL}/account/list",
+                headers={"Authorization": f"Bearer {TRADOVATE_ACCESS_TOKEN}"},
+                timeout=10
+            )
+            if resp.status_code == 200:
+                log.info("✅ Tradovate token verified successfully")
+                return True
+            else:
+                log.warning("⚠️ Token may be expired — will attempt refresh")
+        except Exception as e:
+            log.error(f"Token verification error: {e}")
+
+    # Method 2: Username + password login
+    if TRADOVATE_USER and TRADOVATE_PASS:
+        try:
+            resp = requests.post(
+                f"{TRADOVATE_API_URL}/auth/accesstokenrequest",
+                json={
+                    "name": TRADOVATE_USER,
+                    "password": TRADOVATE_PASS,
+                    "appId": "TradingBot",
+                    "appVersion": "1.0",
+                    "cid": 0,
+                    "sec": "",
+                    "deviceId": TRADOVATE_DEVICE_ID
+                },
+                timeout=10
+            )
+            data = resp.json()
+            if "accessToken" in data:
+                state["access_token"] = data["accessToken"]
+                log.info("✅ Tradovate login successful")
+                return True
+            else:
+                log.error(f"❌ Tradovate login failed: {data}")
+        except Exception as e:
+            log.error(f"❌ Tradovate connection error: {e}")
+
+    # Method 3: Graceful fallback — run in simulation mode
+    log.warning("⚠️  Running in SIMULATION MODE (no Tradovate connection)")
+    log.warning("    To fix: Add TRADOVATE_ACCESS_TOKEN to Railway variables")
+    log.warning("    Get your token from: tradovate.com → Settings → API Access")
+    state["simulation_mode"] = True
+    return True  # Continue running so brain and news systems still work
+
+
+def get_tradovate_token_instructions():
+    """Log clear instructions for getting a Tradovate access token."""
+    log.info("=" * 60)
+    log.info("HOW TO GET YOUR TRADOVATE ACCESS TOKEN:")
+    log.info("1. Go to trader.tradovate.com")
+    log.info("2. Sign in with Google")
+    log.info("3. Open browser DevTools (F12)")
+    log.info("4. Go to Application → Local Storage")
+    log.info("5. Find 'accessToken' value")
+    log.info("6. Copy it and add to Railway as TRADOVATE_ACCESS_TOKEN")
+    log.info("=" * 60)
 
 
 def tradovate_headers():
@@ -826,11 +879,14 @@ def run_bot():
     log.info(f"   Max daily loss: ${MAX_DAILY_LOSS}")
 
     # Login to Tradovate
-    if not tradovate_login():
-        log.error("Cannot connect to Tradovate. Check credentials.")
-        return
+    tradovate_login()
 
-    get_account()
+    if state.get("simulation_mode"):
+        get_tradovate_token_instructions()
+        log.info("🧠 Brain and news systems still active in simulation mode")
+        log.info("📊 Bot will log signals but not place real trades until connected")
+    else:
+        get_account()
 
     # Schedule daily tasks (Central Time)
     schedule.every().monday.at("06:00").do(pre_market_routine)
