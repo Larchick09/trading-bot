@@ -1,0 +1,48 @@
+# 🚀 HOW TO DEPLOY YOUR TRADING BOT TO RAILWAY
+# ================================================
+# Follow these steps ONE TIME and the bot runs forever
+
+## STEP 1 — Upload bot files to GitHub (free)
+1. Go to github.com and create a free account
+2. Click "New repository"
+3. Name it: trading-bot
+4. Upload these files:
+   - bot.py
+   - requirements.txt
+   - railway.toml
+
+## STEP 2 — Connect Railway to GitHub
+1. Go to railway.app (you already have an account)
+2. Click "New Project"
+3. Click "Deploy from GitHub repo"
+4. Select your trading-bot repository
+5. Railway will automatically detect it's Python
+
+## STEP 3 — Add your secret keys (Variables)
+In Railway, click your project → "Variables" tab
+Add each of these:
+
+  TRADOVATE_USER     → your Tradovate username
+  TRADOVATE_PASS     → your Tradovate password
+  CLAUDE_API_KEY     → get from console.anthropic.com
+  GOOGLE_DRIVE_BRAIN_FOLDER_ID → from Google Drive URL
+
+## STEP 4 — Deploy!
+Click "Deploy" — Railway builds and starts your bot.
+You'll see live logs showing the bot starting up.
+
+## STEP 5 — Phone alerts (optional)
+1. Sign up at pushover.net ($5 one-time)
+2. Add PUSHOVER_TOKEN and PUSHOVER_USER to Railway variables
+3. You'll get phone notifications for every trade
+
+## THAT'S IT!
+The bot now runs 24/7 on Railway's servers.
+It wakes up every trading day at 6 AM CT automatically.
+You never need to touch your computer for it to run.
+
+## HOW TO UPDATE THE BOT LATER
+Just tell Claude what you want changed.
+Claude updates bot.py.
+You upload the new file to GitHub.
+Railway automatically redeploys. Done.
