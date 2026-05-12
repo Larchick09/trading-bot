@@ -1,8 +1,8 @@
 """
 ====================================================
-  TRADING BOT - BOT 1 (MES Micro E-Mini S&P 500)
-  Central Brain: Google Drive / Obsidian Vault
-  Broker: Tradovate (Paper Trading)
+  TRADING BOT - BOT 1
+  Broker: Alpaca Paper Trading (FREE)
+  Brain: Google Drive / Obsidian Vault
   Author: Built with Claude
 ====================================================
 """
@@ -12,926 +12,350 @@ import json
 import time
 import logging
 import schedule
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 import requests
 
-# ── Logging setup ──────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("bot.log"),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.StreamHandler()]
 )
 log = logging.getLogger("TradingBot")
 
-# ── Timezone ───────────────────────────────────────────────────────────────────
 CT = ZoneInfo("America/Chicago")
 
-# ── Config (loaded from environment variables set in Railway) ──────────────────
-TRADOVATE_USER        = os.environ.get("TRADOVATE_USER", "")
-TRADOVATE_PASS        = os.environ.get("TRADOVATE_PASS", "")
-TRADOVATE_DEVICE_ID   = os.environ.get("TRADOVATE_DEVICE_ID", "trading-bot-001")
-TRADOVATE_ACCESS_TOKEN = os.environ.get("TRADOVATE_ACCESS_TOKEN", "")  # manual token option
-TRADOVATE_API_URL     = "https://demo.tradovateapi.com/v1"   # demo = paper trading
-CLAUDE_API_KEY        = os.environ.get("CLAUDE_API_KEY", "")
-GOOGLE_DRIVE_BRAIN    = os.environ.get("GOOGLE_DRIVE_BRAIN_FOLDER_ID", "")
-PUSHOVER_TOKEN        = os.environ.get("PUSHOVER_TOKEN", "")   # phone alerts
-PUSHOVER_USER         = os.environ.get("PUSHOVER_USER", "")
+ALPACA_API_KEY    = os.environ.get("ALPACA_API_KEY", "")
+ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
+ALPACA_BASE_URL   = "https://paper-api.alpaca.markets/v2"
+CLAUDE_API_KEY    = os.environ.get("CLAUDE_API_KEY", "")
+PUSHOVER_TOKEN    = os.environ.get("PUSHOVER_TOKEN", "")
+PUSHOVER_USER     = os.environ.get("PUSHOVER_USER", "")
 
-# ── Risk Rules (matching master_rules.md) ──────────────────────────────────────
-MAX_TRADES_PER_DAY   = 5
-MAX_DAILY_LOSS       = 200.00   # bot shuts off if daily loss hits this
-MAX_DRAWDOWN_PCT     = 0.15     # 15% drawdown = full pause
-MIN_CONFIDENCE       = 80       # minimum % confidence to trade
-CONTRACTS            = 2        # MES contracts per trade
-STOP_TICKS           = 4        # stop loss in ticks (1 tick = $1.25 MES)
-TARGET_TICKS         = 8        # profit target in ticks
-TICK_VALUE           = 1.25     # MES tick value in dollars
+MAX_TRADES_PER_DAY = 5
+MAX_DAILY_LOSS     = 200.00
+MIN_CONFIDENCE     = 80
+SYMBOL             = "SPY"
+QTY                = 2
 
-# ── Trading Hours (Central Time) ───────────────────────────────────────────────
-MARKET_OPEN          = (9, 30)
-FIRST_TRADE          = (9, 45)
-LUNCH_START          = (11, 30)
-LUNCH_END            = (13, 0)
-LAST_ENTRY           = (15, 30)
-CLOSE_ALL            = (15, 45)
-
-# ── State ──────────────────────────────────────────────────────────────────────
 state = {
     "trades_today": 0,
     "daily_pnl": 0.0,
-    "session_active": False,
-    "access_token": None,
-    "account_id": None,
     "position": None,
     "brain": {},
     "news_sentiment": "neutral",
+    "news_score": 50,
     "skip_day": False,
-    "trade_log": []
+    "trade_log": [],
+    "connected": False
 }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 1: TRADOVATE CONNECTION
-# ══════════════════════════════════════════════════════════════════════════════
-
-def tradovate_login():
-    """
-    Authenticate with Tradovate demo API.
-    Supports three methods in order of priority:
-    1. Manual access token (best for Google accounts)
-    2. Username + password (for regular accounts)
-    3. Graceful fallback with clear instructions
-    """
-    log.info("Logging into Tradovate demo...")
-
-    # Method 1: Use manually provided access token (Google OAuth accounts)
-    if TRADOVATE_ACCESS_TOKEN:
-        log.info("Using manual access token for Google account...")
-        state["access_token"] = TRADOVATE_ACCESS_TOKEN
-        # Verify the token works
-        try:
-            resp = requests.get(
-                f"{TRADOVATE_API_URL}/account/list",
-                headers={"Authorization": f"Bearer {TRADOVATE_ACCESS_TOKEN}"},
-                timeout=10
-            )
-            if resp.status_code == 200:
-                log.info("✅ Tradovate token verified successfully")
-                return True
-            else:
-                log.warning("⚠️ Token may be expired — will attempt refresh")
-        except Exception as e:
-            log.error(f"Token verification error: {e}")
-
-    # Method 2: Username + password login
-    if TRADOVATE_USER and TRADOVATE_PASS:
-        try:
-            resp = requests.post(
-                f"{TRADOVATE_API_URL}/auth/accesstokenrequest",
-                json={
-                    "name": TRADOVATE_USER,
-                    "password": TRADOVATE_PASS,
-                    "appId": "TradingBot",
-                    "appVersion": "1.0",
-                    "cid": 0,
-                    "sec": "",
-                    "deviceId": TRADOVATE_DEVICE_ID
-                },
-                timeout=10
-            )
-            data = resp.json()
-            if "accessToken" in data:
-                state["access_token"] = data["accessToken"]
-                log.info("✅ Tradovate login successful")
-                return True
-            else:
-                log.error(f"❌ Tradovate login failed: {data}")
-        except Exception as e:
-            log.error(f"❌ Tradovate connection error: {e}")
-
-    # Method 3: Graceful fallback — run in simulation mode
-    log.warning("⚠️  Running in SIMULATION MODE (no Tradovate connection)")
-    log.warning("    To fix: Add TRADOVATE_ACCESS_TOKEN to Railway variables")
-    log.warning("    Get your token from: tradovate.com → Settings → API Access")
-    state["simulation_mode"] = True
-    return True  # Continue running so brain and news systems still work
-
-
-def get_tradovate_token_instructions():
-    """Log clear instructions for getting a Tradovate access token."""
-    log.info("=" * 60)
-    log.info("HOW TO GET YOUR TRADOVATE ACCESS TOKEN:")
-    log.info("1. Go to trader.tradovate.com")
-    log.info("2. Sign in with Google")
-    log.info("3. Open browser DevTools (F12)")
-    log.info("4. Go to Application → Local Storage")
-    log.info("5. Find 'accessToken' value")
-    log.info("6. Copy it and add to Railway as TRADOVATE_ACCESS_TOKEN")
-    log.info("=" * 60)
-
-
-def tradovate_headers():
+def alpaca_headers():
     return {
-        "Authorization": f"Bearer {state['access_token']}",
+        "APCA-API-KEY-ID": ALPACA_API_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
         "Content-Type": "application/json"
     }
 
 
-def get_account():
-    """Get account ID and balance."""
+def alpaca_connect():
+    log.info("Connecting to Alpaca paper trading...")
     try:
-        resp = requests.get(f"{TRADOVATE_API_URL}/account/list",
-                            headers=tradovate_headers(), timeout=10)
-        accounts = resp.json()
-        if accounts:
-            state["account_id"] = accounts[0]["id"]
-            balance = accounts[0].get("balance", 0)
-            log.info(f"📊 Account: {state['account_id']} | Balance: ${balance:,.2f}")
-            return balance
+        resp = requests.get(f"{ALPACA_BASE_URL}/account",
+                            headers=alpaca_headers(), timeout=10)
+        if resp.status_code == 200:
+            account = resp.json()
+            balance = float(account.get("portfolio_value", 0))
+            log.info(f"✅ Alpaca connected! Portfolio: ${balance:,.2f}")
+            state["connected"] = True
+            return True
+        else:
+            log.error(f"❌ Alpaca failed: {resp.status_code} {resp.text}")
+            return False
     except Exception as e:
-        log.error(f"Error getting account: {e}")
+        log.error(f"❌ Alpaca error: {e}")
+        return False
+
+
+def get_current_price(symbol=SYMBOL):
+    try:
+        resp = requests.get(
+            f"https://data.alpaca.markets/v2/stocks/{symbol}/quotes/latest",
+            headers=alpaca_headers(), timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            ask = data.get("quote", {}).get("ap", 0)
+            bid = data.get("quote", {}).get("bp", 0)
+            return (ask + bid) / 2 if ask and bid else 0
+    except Exception as e:
+        log.error(f"Price error: {e}")
     return 0
 
 
-def get_market_data(symbol="MESM6"):
-    """Get current price and market data for MES futures."""
+def place_order(direction, symbol=SYMBOL):
+    side = "buy" if direction == "LONG" else "sell"
     try:
-        resp = requests.get(
-            f"{TRADOVATE_API_URL}/md/getChart",
-            headers=tradovate_headers(),
-            params={"symbol": symbol, "chartDescription": {"underlyingType": "MinuteBar", "elementSize": 5}},
-            timeout=10
+        resp = requests.post(
+            f"{ALPACA_BASE_URL}/orders",
+            headers=alpaca_headers(),
+            json={
+                "symbol": symbol,
+                "qty": QTY,
+                "side": side,
+                "type": "market",
+                "time_in_force": "day"
+            }, timeout=10
         )
-        return resp.json()
+        if resp.status_code in [200, 201]:
+            order = resp.json()
+            log.info(f"✅ Order: {side.upper()} {QTY}x {symbol}")
+            return order
+        else:
+            log.error(f"❌ Order failed: {resp.text}")
     except Exception as e:
-        log.error(f"Error getting market data: {e}")
-        return None
+        log.error(f"Order error: {e}")
+    return None
 
 
-def place_order(direction, symbol="MESM6"):
-    """Place a market order on Tradovate."""
-    action = "Buy" if direction == "LONG" else "Sell"
+def close_position(symbol=SYMBOL):
     try:
-        resp = requests.post(f"{TRADOVATE_API_URL}/order/placeorder",
-                             headers=tradovate_headers(),
-                             json={
-                                 "accountSpec": TRADOVATE_USER,
-                                 "accountId": state["account_id"],
-                                 "action": action,
-                                 "symbol": symbol,
-                                 "orderQty": CONTRACTS,
-                                 "orderType": "Market",
-                                 "isAutomated": True
-                             }, timeout=10)
-        result = resp.json()
-        log.info(f"📈 Order placed: {action} {CONTRACTS}x {symbol} → {result}")
-        return result
-    except Exception as e:
-        log.error(f"Error placing order: {e}")
-        return None
-
-
-def close_position(symbol="MESM6"):
-    """Close all open positions."""
-    try:
-        resp = requests.post(f"{TRADOVATE_API_URL}/order/liquidateposition",
-                             headers=tradovate_headers(),
-                             json={
-                                 "accountId": state["account_id"],
-                                 "symbol": symbol,
-                                 "isAutomated": True
-                             }, timeout=10)
-        log.info(f"🚪 Position closed: {resp.json()}")
+        resp = requests.delete(
+            f"{ALPACA_BASE_URL}/positions/{symbol}",
+            headers=alpaca_headers(), timeout=10
+        )
+        if resp.status_code in [200, 204]:
+            log.info(f"🚪 Position closed: {symbol}")
         state["position"] = None
     except Exception as e:
-        log.error(f"Error closing position: {e}")
+        log.error(f"Close error: {e}")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 2: THE BRAIN — READ FROM GOOGLE DRIVE / OBSIDIAN
-# ══════════════════════════════════════════════════════════════════════════════
-
-def read_brain_file(filename):
-    """Read a file from the Trading Brain folder in Google Drive via API."""
-    try:
-        # Search for the file in Google Drive
-        search_url = "https://www.googleapis.com/drive/v3/files"
-        # In production this uses OAuth2 token from Railway env vars
-        # For now reads from local brain folder as fallback
-        local_path = f"trading-brain/{filename}"
-        if os.path.exists(local_path):
-            with open(local_path, "r") as f:
-                return f.read()
-    except Exception as e:
-        log.error(f"Error reading brain file {filename}: {e}")
+def read_brain_file(filepath):
+    if os.path.exists(filepath):
+        with open(filepath) as f:
+            return f.read()
     return ""
 
 
 def load_brain():
-    """Load the entire Trading Brain into memory."""
     log.info("🧠 Loading Trading Brain...")
     state["brain"] = {
-        "master_rules": read_brain_file("Bot_Rules/master_rules.md"),
-        "strategies": {
-            "vwap": read_brain_file("Strategies/VWAP_Breakout.md"),
-            "orb": read_brain_file("Strategies/Opening_Range_Breakout.md"),
-        },
-        "recent_failures": get_recent_failures(),
-        "recent_successes": get_recent_successes(),
+        "master_rules": read_brain_file("trading-brain/Bot_Rules/master_rules.md"),
+        "vwap_strategy": read_brain_file("trading-brain/Strategies/VWAP_Breakout.md"),
+        "orb_strategy": read_brain_file("trading-brain/Strategies/Opening_Range_Breakout.md"),
+        "recent_failures": [],
+        "recent_successes": [],
     }
-    log.info("✅ Brain loaded successfully")
-
-
-def get_recent_failures(limit=10):
-    """Get the most recent failure logs from the brain."""
-    failures = []
-    failure_dir = "trading-brain/Failures"
-    if os.path.exists(failure_dir):
-        files = sorted([f for f in os.listdir(failure_dir)
-                        if f.startswith("failure_")])[-limit:]
-        for f in files:
-            with open(f"{failure_dir}/{f}") as fh:
-                failures.append(fh.read())
-    return failures
-
-
-def get_recent_successes(limit=10):
-    """Get the most recent success logs from the brain."""
-    successes = []
-    success_dir = "trading-brain/Successes"
-    if os.path.exists(success_dir):
-        files = sorted([f for f in os.listdir(success_dir)
-                        if f.startswith("success_")])[-limit:]
-        for f in files:
-            with open(f"{success_dir}/{f}") as fh:
-                successes.append(fh.read())
-    return successes
+    log.info("✅ Brain loaded")
 
 
 def log_trade_to_brain(trade_data, outcome):
-    """Write trade result back to the Trading Brain."""
     now = datetime.now(CT)
-    filename_date = now.strftime("%Y%m%d_%H%M%S")
-    folder = "Successes" if outcome == "WIN" else "Failures"
-    template_file = "TEMPLATE_success.md" if outcome == "WIN" else "TEMPLATE_failure.md"
-
-    content = f"""# {'✅' if outcome == 'WIN' else '❌'} Trade {outcome} — {now.strftime('%Y-%m-%d %H:%M')}
+    folder = "trading-brain/Successes" if outcome == "WIN" else "trading-brain/Failures"
+    os.makedirs(folder, exist_ok=True)
+    filename = f"{folder}/{'success' if outcome == 'WIN' else 'failure'}_{now.strftime('%Y%m%d_%H%M%S')}.md"
+    icon = "✅" if outcome == "WIN" else "❌"
+    content = f"""# {icon} {outcome} — {now.strftime('%Y-%m-%d %H:%M CT')}
 
 ## Trade Details
-- **Date:** {now.strftime('%Y-%m-%d')}
-- **Bot:** Bot-1 (MES)
-- **Strategy:** {trade_data.get('strategy', 'Unknown')}
-- **Direction:** {trade_data.get('direction', 'Unknown')}
-- **Entry Price:** {trade_data.get('entry_price', 0)}
-- **Exit Price:** {trade_data.get('exit_price', 0)}
-- **{'Profit' if outcome == 'WIN' else 'Loss'} Amount:** ${abs(trade_data.get('pnl', 0)):.2f}
-- **Contracts:** {CONTRACTS}
-
-## Market Conditions at Entry
-- **VIX:** {trade_data.get('vix', 'N/A')}
-- **Time of Day:** {trade_data.get('time', 'N/A')}
-- **News Sentiment:** {state.get('news_sentiment', 'neutral')}
-
-## Confidence Score Breakdown
-- VWAP signal: {trade_data.get('vwap_signal', 'N/A')}
-- Volume confirmation: {trade_data.get('volume_ok', 'N/A')}
-- RSI reading: {trade_data.get('rsi', 'N/A')}
-- News sentiment score: {trade_data.get('news_score', 'N/A')}
-- **Final confidence score:** {trade_data.get('confidence', 0)}%
+- **Symbol:** {trade_data.get('symbol', SYMBOL)}
+- **Direction:** {trade_data.get('direction', 'N/A')}
+- **Entry:** ${trade_data.get('entry_price', 0):.2f}
+- **Exit:** ${trade_data.get('exit_price', 0):.2f}
+- **P&L:** ${trade_data.get('pnl', 0):.2f}
+- **Confidence:** {trade_data.get('confidence', 0)}%
+- **News Sentiment:** {state['news_sentiment']}
 
 ## What the Bot Should Learn
-> {trade_data.get('lesson', 'Auto-logged. Review for patterns.')}
+> {trade_data.get('lesson', 'Review this trade.')}
 
 ## Tags
-`#{'success' if outcome == 'WIN' else 'failure'}` `#{trade_data.get('strategy', 'unknown').lower().replace(' ', '-')}` `#{now.strftime('%B-%Y').lower()}`
+`#{'success' if outcome == 'WIN' else 'failure'}`
 """
-
-    # Save locally
-    os.makedirs(f"trading-brain/{folder}", exist_ok=True)
-    filepath = f"trading-brain/{folder}/{folder.lower()}_{filename_date}.md"
-    with open(filepath, "w") as f:
+    with open(filename, "w") as f:
         f.write(content)
+    log.info(f"🧠 Trade logged: {filename}")
 
-    log.info(f"🧠 Trade logged to brain: {filepath}")
-
-    # Update daily summary
-    update_daily_summary(trade_data, outcome)
-
-
-def update_daily_summary(trade_data, outcome):
-    """Update today's performance summary in the brain."""
-    today = datetime.now(CT).strftime("%Y-%m-%d")
-    summary_path = f"trading-brain/Performance/daily_{today}.md"
-
-    # Load existing or create new
-    if os.path.exists(summary_path):
-        with open(summary_path) as f:
-            existing = f.read()
-    else:
-        existing = f"# 📊 Daily Summary — {today}\n\n## Trades\n"
-
-    # Append trade
-    trade_line = f"| {trade_data.get('time', '')} | {trade_data.get('strategy', '')} | {trade_data.get('direction', '')} | {trade_data.get('entry_price', '')} | {trade_data.get('exit_price', '')} | ${trade_data.get('pnl', 0):.2f} | {trade_data.get('confidence', 0)}% | {'✅' if outcome == 'WIN' else '❌'} |\n"
-
-    with open(summary_path, "a") as f:
-        f.write(trade_line)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 3: NEWS & SENTIMENT CHECK
-# ══════════════════════════════════════════════════════════════════════════════
 
 def check_news_and_calendar():
-    """Use Claude to analyze market news and economic calendar."""
-    log.info("📰 Checking news and economic calendar...")
+    log.info("📰 Checking news and calendar...")
     today = datetime.now(CT).strftime("%Y-%m-%d")
-
     prompt = f"""You are a trading risk analyst. Today is {today}.
-
-Analyze the following and return ONLY a JSON object:
-
-1. Are there any major economic events today that would make futures trading risky?
-   (Fed meetings, CPI, jobs report, GDP, major geopolitical events)
-2. What is the overall market sentiment today based on your knowledge?
-3. Should the bot skip trading today?
-
-Return ONLY this JSON (no other text):
+Are there major economic events today that make US stock trading risky?
+Return ONLY this JSON:
 {{
-  "skip_day": true/false,
-  "skip_reason": "reason if skipping, empty string if not",
-  "sentiment": "bullish/bearish/neutral",
-  "sentiment_score": 0-100,
-  "risk_events": ["list", "of", "events"],
-  "news_summary": "2 sentence summary of market conditions today"
+  "skip_day": false,
+  "skip_reason": "",
+  "sentiment": "neutral",
+  "sentiment_score": 50,
+  "news_summary": "Market conditions summary here."
 }}"""
-
     try:
-        resp = requests.post("https://api.anthropic.com/v1/messages",
-                             headers={
-                                 "Content-Type": "application/json",
-                                 "x-api-key": CLAUDE_API_KEY,
-                                 "anthropic-version": "2023-06-01"
-                             },
-                             json={
-                                 "model": "claude-sonnet-4-20250514",
-                                 "max_tokens": 500,
-                                 "messages": [{"role": "user", "content": prompt}]
-                             }, timeout=30)
-
-        content = resp.json()["content"][0]["text"]
-        # Strip any markdown fences
-        clean = content.replace("```json", "").replace("```", "").strip()
-        news_data = json.loads(clean)
-
-        state["skip_day"] = news_data.get("skip_day", False)
-        state["news_sentiment"] = news_data.get("sentiment", "neutral")
-        state["news_score"] = news_data.get("sentiment_score", 50)
-        state["news_summary"] = news_data.get("news_summary", "")
-        state["risk_events"] = news_data.get("risk_events", [])
-
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": CLAUDE_API_KEY,
+                "anthropic-version": "2023-06-01"
+            },
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 300,
+                "messages": [{"role": "user", "content": prompt}]
+            }, timeout=30
+        )
+        text = resp.json()["content"][0]["text"]
+        data = json.loads(text.replace("```json", "").replace("```", "").strip())
+        state["skip_day"] = data.get("skip_day", False)
+        state["news_sentiment"] = data.get("sentiment", "neutral")
+        state["news_score"] = data.get("sentiment_score", 50)
         if state["skip_day"]:
-            log.warning(f"⚠️  SKIP DAY: {news_data.get('skip_reason')}")
-            send_alert(f"⚠️ Bot skipping today: {news_data.get('skip_reason')}")
+            log.warning(f"⚠️  SKIP DAY: {data.get('skip_reason')}")
         else:
-            log.info(f"📰 News sentiment: {state['news_sentiment']} ({state['news_score']}/100)")
-            log.info(f"📰 {state['news_summary']}")
-
+            log.info(f"📰 Sentiment: {state['news_sentiment']} | {data.get('news_summary', '')}")
     except Exception as e:
-        log.error(f"News check failed: {e}")
+        log.error(f"News error: {e}")
         state["skip_day"] = False
         state["news_sentiment"] = "neutral"
         state["news_score"] = 50
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 4: CONFIDENCE SCORING ENGINE (THE BRAIN CHECK)
-# ══════════════════════════════════════════════════════════════════════════════
-
 def calculate_confidence(signal_data):
-    """
-    Ask Claude to score a trade signal against the full Trading Brain.
-    Returns confidence score 0-100 and reasoning.
-    """
-    brain = state["brain"]
-    recent_failures = "\n\n".join(brain.get("recent_failures", [])[-5:]) or "None yet"
-    recent_successes = "\n\n".join(brain.get("recent_successes", [])[-5:]) or "None yet"
+    prompt = f"""You are a trading analyst. Score this trade signal.
 
-    prompt = f"""You are a professional futures trading analyst with access to a trading knowledge base.
-
-## PROPOSED TRADE SIGNAL
-- Instrument: MES (Micro E-Mini S&P 500 Futures)
+SIGNAL:
+- Symbol: {signal_data['symbol']}
 - Direction: {signal_data['direction']}
 - Strategy: {signal_data['strategy']}
-- Current Price: {signal_data['price']}
-- VWAP: {signal_data['vwap']}
-- RSI (5min): {signal_data['rsi']}
-- Volume vs Average: {signal_data['volume_ratio']}x
+- Price: ${signal_data['price']:.2f}
 - Time: {signal_data['time']}
-- News Sentiment: {state['news_sentiment']} ({state.get('news_score', 50)}/100)
+- News sentiment: {state['news_sentiment']} ({state['news_score']}/100)
 
-## STRATEGY RULES
-{brain['strategies'].get(signal_data['strategy_key'], 'No strategy loaded')}
-
-## RECENT FAILURES (learn from these)
-{recent_failures}
-
-## RECENT SUCCESSES (replicate these)
-{recent_successes}
-
-## MASTER RULES
-{brain['master_rules'][:500]}
-
-Based on ALL of the above, score this trade signal.
-
-Return ONLY this JSON (no other text):
+Return ONLY this JSON:
 {{
-  "confidence": 0-100,
-  "execute": true/false,
-  "reasoning": "2-3 sentence explanation",
-  "risk_factors": ["any", "red", "flags"],
-  "lesson_if_loss": "what to learn if this trade loses"
+  "confidence": 75,
+  "execute": false,
+  "reasoning": "Explanation here.",
+  "lesson_if_loss": "What to learn if this loses."
 }}
 
-The confidence must be 80 or above for execute to be true."""
+execute must be false if confidence < {MIN_CONFIDENCE}."""
 
     try:
-        resp = requests.post("https://api.anthropic.com/v1/messages",
-                             headers={
-                                 "Content-Type": "application/json",
-                                 "x-api-key": CLAUDE_API_KEY,
-                                 "anthropic-version": "2023-06-01"
-                             },
-                             json={
-                                 "model": "claude-sonnet-4-20250514",
-                                 "max_tokens": 500,
-                                 "messages": [{"role": "user", "content": prompt}]
-                             }, timeout=30)
-
-        content = resp.json()["content"][0]["text"]
-        clean = content.replace("```json", "").replace("```", "").strip()
-        result = json.loads(clean)
-
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": CLAUDE_API_KEY,
+                "anthropic-version": "2023-06-01"
+            },
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 200,
+                "messages": [{"role": "user", "content": prompt}]
+            }, timeout=30
+        )
+        text = resp.json()["content"][0]["text"]
+        result = json.loads(text.replace("```json", "").replace("```", "").strip())
         confidence = result.get("confidence", 0)
         execute = result.get("execute", False) and confidence >= MIN_CONFIDENCE
-
-        log.info(f"🧠 Brain check: {confidence}% confidence — {'✅ EXECUTE' if execute else '❌ SKIP'}")
-        log.info(f"🧠 Reasoning: {result.get('reasoning', '')}")
-
-        return {
-            "confidence": confidence,
-            "execute": execute,
-            "reasoning": result.get("reasoning", ""),
-            "risk_factors": result.get("risk_factors", []),
-            "lesson_if_loss": result.get("lesson_if_loss", "")
-        }
-
+        log.info(f"🧠 Brain: {confidence}% — {'✅ EXECUTE' if execute else '❌ SKIP'}")
+        log.info(f"🧠 {result.get('reasoning', '')}")
+        return {**result, "execute": execute}
     except Exception as e:
-        log.error(f"Confidence scoring failed: {e}")
-        return {"confidence": 0, "execute": False, "reasoning": "Error in brain check"}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 5: STRATEGY SIGNALS
-# ══════════════════════════════════════════════════════════════════════════════
-
-def calculate_vwap(prices, volumes):
-    """Calculate VWAP from price/volume data."""
-    if not prices or not volumes:
-        return 0
-    cumulative_pv = sum(p * v for p, v in zip(prices, volumes))
-    cumulative_v = sum(volumes)
-    return cumulative_pv / cumulative_v if cumulative_v > 0 else 0
+        log.error(f"Confidence error: {e}")
+        return {"confidence": 0, "execute": False, "reasoning": "Error", "lesson_if_loss": ""}
 
 
 def calculate_rsi(prices, period=14):
-    """Calculate RSI from price list."""
     if len(prices) < period + 1:
         return 50
-    gains, losses = [], []
-    for i in range(1, len(prices)):
-        change = prices[i] - prices[i - 1]
-        gains.append(max(change, 0))
-        losses.append(max(-change, 0))
+    gains = [max(prices[i] - prices[i-1], 0) for i in range(1, len(prices))]
+    losses = [max(prices[i-1] - prices[i], 0) for i in range(1, len(prices))]
     avg_gain = sum(gains[-period:]) / period
     avg_loss = sum(losses[-period:]) / period
     if avg_loss == 0:
         return 100
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    return 100 - (100 / (1 + avg_gain / avg_loss))
 
 
-def check_vwap_signal(market_data):
-    """Check for VWAP breakout signal."""
+def get_bars(symbol=SYMBOL, limit=50):
+    try:
+        resp = requests.get(
+            f"https://data.alpaca.markets/v2/stocks/{symbol}/bars",
+            headers=alpaca_headers(),
+            params={"timeframe": "5Min", "limit": limit},
+            timeout=10
+        )
+        if resp.status_code == 200:
+            return resp.json().get("bars", [])
+    except Exception as e:
+        log.error(f"Bars error: {e}")
+    return []
+
+
+def check_signal():
     now = datetime.now(CT)
     hour, minute = now.hour, now.minute
 
-    # Only trade in allowed hours
-    if (hour, minute) < FIRST_TRADE:
+    if (hour, minute) < (9, 45):
         return None
-    if LUNCH_START <= (hour, minute) < LUNCH_END:
+    if (11, 30) <= (hour, minute) < (13, 0):
         return None
-    if (hour, minute) > LAST_ENTRY:
-        return None
-
-    # In production: parse real market data from Tradovate
-    # For now: return signal structure for brain to evaluate
-    # This gets filled with real data from the Tradovate WebSocket
-    prices = market_data.get("prices", [])
-    volumes = market_data.get("volumes", [])
-
-    if len(prices) < 20:
+    if (hour, minute) > (15, 30):
         return None
 
-    current_price = prices[-1]
-    vwap = calculate_vwap(prices, volumes)
-    rsi = calculate_rsi(prices)
-    avg_volume = sum(volumes[:-1]) / len(volumes[:-1]) if len(volumes) > 1 else 1
-    current_volume = volumes[-1] if volumes else 0
-    volume_ratio = current_volume / avg_volume if avg_volume > 0 else 0
+    bars = get_bars()
+    if len(bars) < 20:
+        return None
 
-    # VWAP breakout condition
-    prev_price = prices[-2] if len(prices) >= 2 else current_price
+    closes = [b["c"] for b in bars]
+    volumes = [b["v"] for b in bars]
+    current_price = closes[-1]
+
+    total_vol = sum(volumes)
+    vwap = sum(c * v for c, v in zip(closes, volumes)) / total_vol if total_vol > 0 else current_price
+    rsi = calculate_rsi(closes)
+
+    avg_vol = sum(volumes[:-1]) / len(volumes[:-1]) if len(volumes) > 1 else 1
+    vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 0
+
+    prev_price = closes[-2] if len(closes) >= 2 else current_price
     crossed_above = prev_price < vwap and current_price > vwap
     crossed_below = prev_price > vwap and current_price < vwap
 
     if not (crossed_above or crossed_below):
         return None
 
-    if volume_ratio < 1.3:  # Not enough volume confirmation
-        log.info(f"⚠️  VWAP signal detected but volume too low ({volume_ratio:.1f}x)")
+    if vol_ratio < 1.3:
+        log.info(f"⚠️  Signal but low volume ({vol_ratio:.1f}x)")
         return None
 
     direction = "LONG" if crossed_above else "SHORT"
-
     return {
+        "symbol": SYMBOL,
         "strategy": "VWAP Breakout",
-        "strategy_key": "vwap",
         "direction": direction,
         "price": current_price,
         "vwap": round(vwap, 2),
         "rsi": round(rsi, 1),
-        "volume_ratio": round(volume_ratio, 2),
+        "volume_ratio": round(vol_ratio, 2),
         "time": now.strftime("%H:%M CT"),
     }
 
-
-def check_orb_signal(market_data, opening_range):
-    """Check for Opening Range Breakout signal (9:45-10:30 CT only)."""
-    now = datetime.now(CT)
-    hour, minute = now.hour, now.minute
-
-    # ORB only valid in morning window
-    if not ((9, 45) <= (hour, minute) <= (10, 30)):
-        return None
-
-    if not opening_range:
-        return None
-
-    prices = market_data.get("prices", [])
-    volumes = market_data.get("volumes", [])
-
-    if not prices:
-        return None
-
-    current_price = prices[-1]
-    orb_high = opening_range["high"]
-    orb_low = opening_range["low"]
-
-    avg_volume = sum(volumes[:-1]) / len(volumes[:-1]) if len(volumes) > 1 else 1
-    current_volume = volumes[-1] if volumes else 0
-    volume_ratio = current_volume / avg_volume if avg_volume > 0 else 0
-
-    if current_price > orb_high and volume_ratio >= 1.3:
-        direction = "LONG"
-    elif current_price < orb_low and volume_ratio >= 1.3:
-        direction = "SHORT"
-    else:
-        return None
-
-    vwap = calculate_vwap(prices, volumes)
-    rsi = calculate_rsi(prices)
-
-    return {
-        "strategy": "Opening Range Breakout",
-        "strategy_key": "orb",
-        "direction": direction,
-        "price": current_price,
-        "vwap": round(vwap, 2),
-        "rsi": round(rsi, 1),
-        "volume_ratio": round(volume_ratio, 2),
-        "time": now.strftime("%H:%M CT"),
-        "orb_high": orb_high,
-        "orb_low": orb_low,
-    }
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 6: RISK MANAGEMENT
-# ══════════════════════════════════════════════════════════════════════════════
 
 def check_risk_limits():
-    """Check if bot should stop trading based on risk rules."""
     if state["trades_today"] >= MAX_TRADES_PER_DAY:
-        log.warning(f"⛔ Max trades reached ({MAX_TRADES_PER_DAY})")
+        log.warning(f"⛔ Max trades reached")
         return False
     if state["daily_pnl"] <= -MAX_DAILY_LOSS:
-        log.warning(f"⛔ Daily loss limit hit (${state['daily_pnl']:.2f})")
-        send_alert(f"⛔ Daily loss limit hit! Bot stopped for today. P&L: ${state['daily_pnl']:.2f}")
+        log.warning(f"⛔ Daily loss limit hit")
+        send_alert(f"⛔ Daily loss limit! P&L: ${state['daily_pnl']:.2f}")
         return False
     return True
 
-
-def calculate_pnl(entry_price, exit_price, direction):
-    """Calculate P&L for a completed trade."""
-    ticks = (exit_price - entry_price) / 0.25  # MES tick = 0.25 points
-    if direction == "SHORT":
-        ticks = -ticks
-    return ticks * TICK_VALUE * CONTRACTS
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 7: PHONE ALERTS
-# ══════════════════════════════════════════════════════════════════════════════
-
-def send_alert(message):
-    """Send push notification to phone via Pushover."""
-    if not PUSHOVER_TOKEN or not PUSHOVER_USER:
-        log.info(f"📱 Alert (no Pushover configured): {message}")
-        return
-    try:
-        requests.post("https://api.pushover.net/1/messages.json", data={
-            "token": PUSHOVER_TOKEN,
-            "user": PUSHOVER_USER,
-            "message": message,
-            "title": "🤖 Trading Bot"
-        }, timeout=10)
-    except Exception as e:
-        log.error(f"Alert failed: {e}")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 8: MAIN TRADING LOOP
-# ══════════════════════════════════════════════════════════════════════════════
-
-opening_range = None
-
-def pre_market_routine():
-    """6:00 AM CT — Load brain, check news, prepare for the day."""
-    log.info("=" * 60)
-    log.info("🌅 PRE-MARKET ROUTINE STARTING")
-    log.info("=" * 60)
-
-    # Reset daily state
-    state["trades_today"] = 0
-    state["daily_pnl"] = 0.0
-    state["skip_day"] = False
-    state["trade_log"] = []
-
-    # Load brain from Google Drive
-    load_brain()
-
-    # Check news and economic calendar
-    check_news_and_calendar()
-
-    if state["skip_day"]:
-        log.warning("⛔ Bot will NOT trade today due to news risk")
-    else:
-        log.info("✅ Pre-market complete. Bot ready to trade.")
-        send_alert(f"🌅 Bot ready. Sentiment: {state['news_sentiment']}. Watching for signals from 9:45 AM CT.")
-
-
-def establish_opening_range():
-    """9:30-9:45 AM CT — Record the opening range."""
-    global opening_range
-    log.info("📊 Establishing opening range (9:30-9:45 AM)...")
-    # In production: collect real 1-min candles from Tradovate
-    # opening_range = {"high": max_price, "low": min_price}
-    log.info(f"📊 Opening range set: {opening_range}")
-
-
-def trading_loop():
-    """Main trading loop — runs every 60 seconds during market hours."""
-    now = datetime.now(CT)
-    hour, minute = now.hour, now.minute
-
-    # Skip if not trading day or skip flag set
-    if state["skip_day"]:
-        return
-    if now.weekday() >= 5:  # Weekend
-        return
-    if not check_risk_limits():
-        return
-    if state["position"]:  # Already in a trade
-        monitor_position()
-        return
-
-    # Get market data
-    market_data = get_market_data()
-    if not market_data:
-        return
-
-    # Check strategies
-    signal = None
-
-    # Morning: try ORB first
-    if (9, 45) <= (hour, minute) <= (10, 30):
-        signal = check_orb_signal(market_data, opening_range)
-
-    # All day: VWAP breakout
-    if not signal:
-        signal = check_vwap_signal(market_data)
-
-    if not signal:
-        return
-
-    log.info(f"🔔 Signal detected: {signal['strategy']} {signal['direction']} @ {signal['price']}")
-
-    # ── THE BRAIN CHECK ─────────────────────────────────────────────────────
-    brain_result = calculate_confidence(signal)
-
-    if not brain_result["execute"]:
-        log.info(f"⏭️  Signal skipped — confidence {brain_result['confidence']}% < {MIN_CONFIDENCE}%")
-        log.info(f"   Reason: {brain_result['reasoning']}")
-        return
-
-    # ── EXECUTE TRADE ────────────────────────────────────────────────────────
-    log.info(f"✅ EXECUTING: {signal['direction']} @ {signal['price']} | Confidence: {brain_result['confidence']}%")
-    send_alert(f"📈 Trade: {signal['direction']} MES @ {signal['price']} | {brain_result['confidence']}% confidence\n{brain_result['reasoning']}")
-
-    order = place_order(signal["direction"])
-    if order:
-        state["position"] = {
-            **signal,
-            "entry_price": signal["price"],
-            "entry_time": now.isoformat(),
-            "confidence": brain_result["confidence"],
-            "lesson_if_loss": brain_result["lesson_if_loss"],
-            "stop_price": signal["price"] - (STOP_TICKS * 0.25) if signal["direction"] == "LONG"
-                          else signal["price"] + (STOP_TICKS * 0.25),
-            "target_price": signal["price"] + (TARGET_TICKS * 0.25) if signal["direction"] == "LONG"
-                            else signal["price"] - (TARGET_TICKS * 0.25),
-        }
-        state["trades_today"] += 1
-        log.info(f"📍 Position open | Stop: {state['position']['stop_price']} | Target: {state['position']['target_price']}")
-
-
-def monitor_position():
-    """Check if open position has hit target or stop loss."""
-    if not state["position"]:
-        return
-
-    market_data = get_market_data()
-    if not market_data:
-        return
-
-    prices = market_data.get("prices", [])
-    if not prices:
-        return
-
-    current_price = prices[-1]
-    pos = state["position"]
-    direction = pos["direction"]
-    hit_target = (direction == "LONG" and current_price >= pos["target_price"]) or \
-                 (direction == "SHORT" and current_price <= pos["target_price"])
-    hit_stop = (direction == "LONG" and current_price <= pos["stop_price"]) or \
-               (direction == "SHORT" and current_price >= pos["stop_price"])
-
-    if hit_target or hit_stop:
-        outcome = "WIN" if hit_target else "LOSS"
-        pnl = calculate_pnl(pos["entry_price"], current_price, direction)
-        state["daily_pnl"] += pnl
-
-        log.info(f"{'✅ TARGET HIT' if hit_target else '❌ STOP HIT'} | P&L: ${pnl:.2f} | Daily: ${state['daily_pnl']:.2f}")
-        send_alert(f"{'✅ WIN' if hit_target else '❌ LOSS'}: ${pnl:.2f} | Daily P&L: ${state['daily_pnl']:.2f}")
-
-        close_position()
-
-        # Log to brain
-        trade_data = {
-            **pos,
-            "exit_price": current_price,
-            "pnl": pnl,
-            "vwap_signal": pos.get("vwap", "N/A"),
-            "volume_ok": pos.get("volume_ratio", "N/A"),
-            "rsi": pos.get("rsi", "N/A"),
-            "news_score": state.get("news_score", 50),
-            "lesson": pos.get("lesson_if_loss", "") if outcome == "LOSS" else "Replicate this setup."
-        }
-        log_trade_to_brain(trade_data, outcome)
-        state["position"] = None
-
-
-def end_of_day():
-    """3:45 PM CT — Close all positions, send daily summary."""
-    log.info("🚪 END OF DAY — Closing all positions")
-
-    if state["position"]:
-        close_position()
-
-    # Send daily summary
-    wins = sum(1 for t in state["trade_log"] if t.get("outcome") == "WIN")
-    losses = sum(1 for t in state["trade_log"] if t.get("outcome") == "LOSS")
-    summary = (f"📊 Day Complete\n"
-               f"Trades: {state['trades_today']} | "
-               f"Wins: {wins} | Losses: {losses}\n"
-               f"Daily P&L: ${state['daily_pnl']:.2f}\n"
-               f"Brain updated ✅")
-
-    send_alert(summary)
-    log.info(summary)
-    log.info("=" * 60)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 9: SCHEDULER — RUNS EVERYTHING AUTOMATICALLY
-# ══════════════════════════════════════════════════════════════════════════════
-
-def run_bot():
-    """Start the bot with full daily schedule."""
-    log.info("🤖 TRADING BOT STARTING UP")
-    log.info(f"   Instrument: MES Micro E-Mini S&P 500")
-    log.info(f"   Mode: Paper Trading (Tradovate Demo)")
-    log.info(f"   Min confidence: {MIN_CONFIDENCE}%")
-    log.info(f"   Max daily loss: ${MAX_DAILY_LOSS}")
-
-    # Login to Tradovate
-    tradovate_login()
-
-    if state.get("simulation_mode"):
-        get_tradovate_token_instructions()
-        log.info("🧠 Brain and news systems still active in simulation mode")
-        log.info("📊 Bot will log signals but not place real trades until connected")
-    else:
-        get_account()
-
-    # Schedule daily tasks (Central Time)
-    schedule.every().monday.at("06:00").do(pre_market_routine)
-    schedule.every().tuesday.at("06:00").do(pre_market_routine)
-    schedule.every().wednesday.at("06:00").do(pre_market_routine)
-    schedule.every().thursday.at("06:00").do(pre_market_routine)
-    schedule.every().friday.at("06:00").do(pre_market_routine)
-
-    schedule.every().monday.at("09:30").do(establish_opening_range)
-    schedule.every().tuesday.at("09:30").do(establish_opening_range)
-    schedule.every().wednesday.at("09:30").do(establish_opening_range)
-    schedule.every().thursday.at("09:30").do(establish_opening_range)
-    schedule.every().friday.at("09:30").do(establish_opening_range)
-
-    schedule.every().monday.at("15:45").do(end_of_day)
-    schedule.every().tuesday.at("15:45").do(end_of_day)
-    schedule.every().wednesday.at("15:45").do(end_of_day)
-    schedule.every().thursday.at("15:45").do(end_of_day)
-    schedule.every().friday.at("15:45").do(end_of_day)
-
-    # Trading loop — every 60 seconds during market hours
-    schedule.every(60).seconds.do(trading_loop)
-
-    log.info("✅ Scheduler running. Bot is live.")
-    send_alert("🤖 Trading Bot is LIVE and running on Railway!")
-
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
-
-
-if __name__ == "__main__":
-    run_bot()
-:
-        log.warning(f"⛔ Max trades reached ({MAX_TRADES_PER_DAY})")
-        return False
-    if state["daily_pnl"] <= -MAX_DAILY_LOSS:
-        log.warning(f"⛔ Daily loss limit hit (${state['daily_pnl']:.2f})")
-        send_alert(f"⛔ Daily loss limit hit! Bot stopped. P&L: ${state['daily_pnl']:.2f}")
-        return False
-    return True
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 7: ALERTS
-# ══════════════════════════════════════════════════════════════════════════════
 
 def send_alert(message):
     if not PUSHOVER_TOKEN or not PUSHOVER_USER:
@@ -947,9 +371,6 @@ def send_alert(message):
     except Exception as e:
         log.error(f"Alert error: {e}")
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 8: MAIN TRADING LOOP
-# ══════════════════════════════════════════════════════════════════════════════
 
 def pre_market_routine():
     log.info("=" * 60)
@@ -961,7 +382,41 @@ def pre_market_routine():
     load_brain()
     check_news_and_calendar()
     if not state["skip_day"]:
-        send_alert(f"🌅 Bot ready! Sentiment: {state['news_sentiment']}. Trading starts 9:45 AM CT.")
+        send_alert(f"🌅 Bot ready! Sentiment: {state['news_sentiment']}. Trading 9:45 AM CT.")
+
+
+def monitor_position():
+    if not state["position"]:
+        return
+    current_price = get_current_price(state["position"]["symbol"])
+    if not current_price:
+        return
+
+    pos = state["position"]
+    direction = pos["direction"]
+    hit_target = (direction == "LONG" and current_price >= pos["target_price"]) or \
+                 (direction == "SHORT" and current_price <= pos["target_price"])
+    hit_stop = (direction == "LONG" and current_price <= pos["stop_price"]) or \
+               (direction == "SHORT" and current_price >= pos["stop_price"])
+
+    if hit_target or hit_stop:
+        outcome = "WIN" if hit_target else "LOSS"
+        pnl = (current_price - pos["entry_price"]) * QTY
+        if direction == "SHORT":
+            pnl = -pnl
+        state["daily_pnl"] += pnl
+
+        log.info(f"{'✅ WIN' if hit_target else '❌ LOSS'} | P&L: ${pnl:.2f} | Daily: ${state['daily_pnl']:.2f}")
+        send_alert(f"{'✅ WIN' if hit_target else '❌ LOSS'}: ${pnl:.2f} | Daily: ${state['daily_pnl']:.2f}")
+
+        close_position(pos["symbol"])
+        log_trade_to_brain({
+            **pos,
+            "exit_price": current_price,
+            "pnl": pnl,
+            "lesson": pos.get("lesson_if_loss", "") if outcome == "LOSS" else "Replicate this setup."
+        }, outcome)
+
 
 def trading_loop():
     now = datetime.now(CT)
@@ -986,77 +441,40 @@ def trading_loop():
         log.info(f"⏭️  Skipped — {brain_result['confidence']}% confidence")
         return
 
-    log.info(f"✅ EXECUTING: {signal['direction']} {signal['symbol']} @ ${signal['price']:.2f} | {brain_result['confidence']}% confidence")
+    log.info(f"✅ EXECUTING: {signal['direction']} {signal['symbol']} @ ${signal['price']:.2f} | {brain_result['confidence']}%")
     send_alert(f"📈 Trade: {signal['direction']} {signal['symbol']} @ ${signal['price']:.2f} | {brain_result['confidence']}% confidence")
 
     order = place_order(signal["direction"], signal["symbol"])
     if order:
-        stop_offset = signal["price"] * 0.002  # 0.2% stop
-        target_offset = signal["price"] * 0.004  # 0.4% target
+        offset = signal["price"] * 0.002
         state["position"] = {
             **signal,
             "entry_price": signal["price"],
             "confidence": brain_result["confidence"],
             "lesson_if_loss": brain_result.get("lesson_if_loss", ""),
-            "stop_price": signal["price"] - stop_offset if signal["direction"] == "LONG" else signal["price"] + stop_offset,
-            "target_price": signal["price"] + target_offset if signal["direction"] == "LONG" else signal["price"] - target_offset,
+            "stop_price": signal["price"] - offset if signal["direction"] == "LONG" else signal["price"] + offset,
+            "target_price": signal["price"] + offset * 2 if signal["direction"] == "LONG" else signal["price"] - offset * 2,
         }
         state["trades_today"] += 1
 
-def monitor_position():
-    if not state["position"]:
-        return
-    current_price = get_current_price(state["position"]["symbol"])
-    if not current_price:
-        return
-
-    pos = state["position"]
-    direction = pos["direction"]
-    hit_target = (direction == "LONG" and current_price >= pos["target_price"]) or \
-                 (direction == "SHORT" and current_price <= pos["target_price"])
-    hit_stop = (direction == "LONG" and current_price <= pos["stop_price"]) or \
-               (direction == "SHORT" and current_price >= pos["stop_price"])
-
-    if hit_target or hit_stop:
-        outcome = "WIN" if hit_target else "LOSS"
-        pnl = (current_price - pos["entry_price"]) * QTY
-        if direction == "SHORT":
-            pnl = -pnl
-        state["daily_pnl"] += pnl
-
-        log.info(f"{'✅ WIN' if hit_target else '❌ LOSS'} | P&L: ${pnl:.2f} | Daily: ${state['daily_pnl']:.2f}")
-        send_alert(f"{'✅ WIN' if hit_target else '❌ LOSS'}: ${pnl:.2f} | Daily P&L: ${state['daily_pnl']:.2f}")
-
-        close_position(pos["symbol"])
-
-        log_trade_to_brain({
-            **pos,
-            "exit_price": current_price,
-            "pnl": pnl,
-            "lesson": pos.get("lesson_if_loss", "") if outcome == "LOSS" else "Replicate this setup."
-        }, outcome)
 
 def end_of_day():
-    log.info("🚪 END OF DAY — Closing positions")
+    log.info("🚪 END OF DAY")
     if state["position"]:
         close_position(state["position"]["symbol"])
     send_alert(f"📊 Day done! P&L: ${state['daily_pnl']:.2f} | Trades: {state['trades_today']}")
     log.info("=" * 60)
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 9: SCHEDULER
-# ══════════════════════════════════════════════════════════════════════════════
 
 def run_bot():
     log.info("🤖 TRADING BOT STARTING UP")
-    log.info(f"   Broker: Alpaca Paper Trading (FREE)")
+    log.info(f"   Broker: Alpaca Paper Trading")
     log.info(f"   Symbol: {SYMBOL}")
     log.info(f"   Min confidence: {MIN_CONFIDENCE}%")
     log.info(f"   Max daily loss: ${MAX_DAILY_LOSS}")
 
-    if not alpaca_connect():
-        log.error("❌ Cannot connect to Alpaca. Check API keys in Railway variables.")
-        log.info("   Bot will retry connection every 60 seconds...")
+    alpaca_connect()
+    load_brain()
 
     for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
         getattr(schedule.every(), day).at("06:00").do(pre_market_routine)
@@ -1065,11 +483,12 @@ def run_bot():
     schedule.every(60).seconds.do(trading_loop)
 
     log.info("✅ Scheduler running. Bot is live 24/7!")
-    send_alert("🤖 Trading Bot LIVE on Railway with Alpaca paper trading!")
+    send_alert("🤖 Trading Bot LIVE on Railway!")
 
     while True:
         schedule.run_pending()
         time.sleep(1)
+
 
 if __name__ == "__main__":
     run_bot()
