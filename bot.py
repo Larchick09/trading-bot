@@ -208,7 +208,14 @@ Return ONLY this JSON:
                 "messages": [{"role": "user", "content": prompt}]
             }, timeout=30
         )
-        text = resp.json()["content"][0]["text"]
+        resp_json = resp.json()
+        if "content" not in resp_json:
+            log.error(f"News API error: {resp_json.get('error', {}).get('message', str(resp_json))}")
+            state["skip_day"] = False
+            state["news_sentiment"] = "neutral"
+            state["news_score"] = 50
+            return
+        text = resp_json["content"][0]["text"]
         data = json.loads(text.replace("```json", "").replace("```", "").strip())
         state["skip_day"] = data.get("skip_day", False)
         state["news_sentiment"] = data.get("sentiment", "neutral")
