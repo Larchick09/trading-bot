@@ -512,7 +512,6 @@ if __name__ == "__main__":
 
 
 # ── Brain Writer Integration ─────────────────────────────────────────────────
-# Import the brain writer for enhanced trade analysis
 try:
     from brain_writer import write_trade_analysis, load_past_memories, build_memory_context
     BRAIN_WRITER_AVAILABLE = True
@@ -520,3 +519,12 @@ try:
 except ImportError:
     BRAIN_WRITER_AVAILABLE = False
     log.warning("⚠️  Brain writer not available")
+
+# ── Morning Brief Integration ─────────────────────────────────────────────────
+try:
+    from morning_brief import run_morning_brief, get_todays_brief
+    MORNING_BRIEF_AVAILABLE = True
+    log.info("✅ Morning brief loaded")
+except ImportError:
+    MORNING_BRIEF_AVAILABLE = False
+    log.warning("⚠️  Morning brief not available")
