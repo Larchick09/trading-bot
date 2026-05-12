@@ -920,3 +920,156 @@ def run_bot():
 
 if __name__ == "__main__":
     run_bot()
+:
+        log.warning(f"⛔ Max trades reached ({MAX_TRADES_PER_DAY})")
+        return False
+    if state["daily_pnl"] <= -MAX_DAILY_LOSS:
+        log.warning(f"⛔ Daily loss limit hit (${state['daily_pnl']:.2f})")
+        send_alert(f"⛔ Daily loss limit hit! Bot stopped. P&L: ${state['daily_pnl']:.2f}")
+        return False
+    return True
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 7: ALERTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def send_alert(message):
+    if not PUSHOVER_TOKEN or not PUSHOVER_USER:
+        log.info(f"📱 Alert: {message}")
+        return
+    try:
+        requests.post("https://api.pushover.net/1/messages.json", data={
+            "token": PUSHOVER_TOKEN,
+            "user": PUSHOVER_USER,
+            "message": message,
+            "title": "🤖 Trading Bot"
+        }, timeout=10)
+    except Exception as e:
+        log.error(f"Alert error: {e}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 8: MAIN TRADING LOOP
+# ══════════════════════════════════════════════════════════════════════════════
+
+def pre_market_routine():
+    log.info("=" * 60)
+    log.info("🌅 PRE-MARKET STARTING")
+    state["trades_today"] = 0
+    state["daily_pnl"] = 0.0
+    state["skip_day"] = False
+    state["trade_log"] = []
+    load_brain()
+    check_news_and_calendar()
+    if not state["skip_day"]:
+        send_alert(f"🌅 Bot ready! Sentiment: {state['news_sentiment']}. Trading starts 9:45 AM CT.")
+
+def trading_loop():
+    now = datetime.now(CT)
+    if now.weekday() >= 5:
+        return
+    if state["skip_day"]:
+        return
+    if not check_risk_limits():
+        return
+    if state["position"]:
+        monitor_position()
+        return
+
+    signal = check_signal()
+    if not signal:
+        return
+
+    log.info(f"🔔 Signal: {signal['strategy']} {signal['direction']} @ ${signal['price']:.2f}")
+
+    brain_result = calculate_confidence(signal)
+    if not brain_result["execute"]:
+        log.info(f"⏭️  Skipped — {brain_result['confidence']}% confidence")
+        return
+
+    log.info(f"✅ EXECUTING: {signal['direction']} {signal['symbol']} @ ${signal['price']:.2f} | {brain_result['confidence']}% confidence")
+    send_alert(f"📈 Trade: {signal['direction']} {signal['symbol']} @ ${signal['price']:.2f} | {brain_result['confidence']}% confidence")
+
+    order = place_order(signal["direction"], signal["symbol"])
+    if order:
+        stop_offset = signal["price"] * 0.002  # 0.2% stop
+        target_offset = signal["price"] * 0.004  # 0.4% target
+        state["position"] = {
+            **signal,
+            "entry_price": signal["price"],
+            "confidence": brain_result["confidence"],
+            "lesson_if_loss": brain_result.get("lesson_if_loss", ""),
+            "stop_price": signal["price"] - stop_offset if signal["direction"] == "LONG" else signal["price"] + stop_offset,
+            "target_price": signal["price"] + target_offset if signal["direction"] == "LONG" else signal["price"] - target_offset,
+        }
+        state["trades_today"] += 1
+
+def monitor_position():
+    if not state["position"]:
+        return
+    current_price = get_current_price(state["position"]["symbol"])
+    if not current_price:
+        return
+
+    pos = state["position"]
+    direction = pos["direction"]
+    hit_target = (direction == "LONG" and current_price >= pos["target_price"]) or \
+                 (direction == "SHORT" and current_price <= pos["target_price"])
+    hit_stop = (direction == "LONG" and current_price <= pos["stop_price"]) or \
+               (direction == "SHORT" and current_price >= pos["stop_price"])
+
+    if hit_target or hit_stop:
+        outcome = "WIN" if hit_target else "LOSS"
+        pnl = (current_price - pos["entry_price"]) * QTY
+        if direction == "SHORT":
+            pnl = -pnl
+        state["daily_pnl"] += pnl
+
+        log.info(f"{'✅ WIN' if hit_target else '❌ LOSS'} | P&L: ${pnl:.2f} | Daily: ${state['daily_pnl']:.2f}")
+        send_alert(f"{'✅ WIN' if hit_target else '❌ LOSS'}: ${pnl:.2f} | Daily P&L: ${state['daily_pnl']:.2f}")
+
+        close_position(pos["symbol"])
+
+        log_trade_to_brain({
+            **pos,
+            "exit_price": current_price,
+            "pnl": pnl,
+            "lesson": pos.get("lesson_if_loss", "") if outcome == "LOSS" else "Replicate this setup."
+        }, outcome)
+
+def end_of_day():
+    log.info("🚪 END OF DAY — Closing positions")
+    if state["position"]:
+        close_position(state["position"]["symbol"])
+    send_alert(f"📊 Day done! P&L: ${state['daily_pnl']:.2f} | Trades: {state['trades_today']}")
+    log.info("=" * 60)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 9: SCHEDULER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_bot():
+    log.info("🤖 TRADING BOT STARTING UP")
+    log.info(f"   Broker: Alpaca Paper Trading (FREE)")
+    log.info(f"   Symbol: {SYMBOL}")
+    log.info(f"   Min confidence: {MIN_CONFIDENCE}%")
+    log.info(f"   Max daily loss: ${MAX_DAILY_LOSS}")
+
+    if not alpaca_connect():
+        log.error("❌ Cannot connect to Alpaca. Check API keys in Railway variables.")
+        log.info("   Bot will retry connection every 60 seconds...")
+
+    for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
+        getattr(schedule.every(), day).at("06:00").do(pre_market_routine)
+        getattr(schedule.every(), day).at("15:45").do(end_of_day)
+
+    schedule.every(60).seconds.do(trading_loop)
+
+    log.info("✅ Scheduler running. Bot is live 24/7!")
+    send_alert("🤖 Trading Bot LIVE on Railway with Alpaca paper trading!")
+
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+if __name__ == "__main__":
+    run_bot()
