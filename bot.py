@@ -152,30 +152,32 @@ def load_brain():
 
 
 def log_trade_to_brain(trade_data, outcome):
+    # Add sentiment to trade data
+    trade_data["news_sentiment"] = state["news_sentiment"]
+
+    # Use brain writer for rich analysis if available
+    if BRAIN_WRITER_AVAILABLE:
+        analysis = write_trade_analysis(
+            trade_data, outcome,
+            state["news_sentiment"],
+            state["news_score"]
+        )
+        if analysis:
+            log.info(f"🧠 Brain analysis: {analysis.get('key_lesson', '')}")
+            return
+
+    # Fallback: simple logging
     now = datetime.now(CT)
     folder = "trading-brain/Successes" if outcome == "WIN" else "trading-brain/Failures"
     os.makedirs(folder, exist_ok=True)
     filename = f"{folder}/{'success' if outcome == 'WIN' else 'failure'}_{now.strftime('%Y%m%d_%H%M%S')}.md"
     icon = "✅" if outcome == "WIN" else "❌"
-    content = f"""# {icon} {outcome} — {now.strftime('%Y-%m-%d %H:%M CT')}
-
-## Trade Details
-- **Symbol:** {trade_data.get('symbol', SYMBOL)}
-- **Direction:** {trade_data.get('direction', 'N/A')}
-- **Entry:** ${trade_data.get('entry_price', 0):.2f}
-- **Exit:** ${trade_data.get('exit_price', 0):.2f}
-- **P&L:** ${trade_data.get('pnl', 0):.2f}
-- **Confidence:** {trade_data.get('confidence', 0)}%
-- **News Sentiment:** {state['news_sentiment']}
-
-## What the Bot Should Learn
-> {trade_data.get('lesson', 'Review this trade.')}
-
-## Tags
-`#{'success' if outcome == 'WIN' else 'failure'}`
+    simple_content = f"""# {icon} {outcome} — {now.strftime('%Y-%m-%d %H:%M CT')}
+- Entry: ${trade_data.get('entry_price', 0):.2f} | Exit: ${trade_data.get('exit_price', 0):.2f}
+- P&L: ${trade_data.get('pnl', 0):.2f} | Confidence: {trade_data.get('confidence', 0)}%
 """
     with open(filename, "w") as f:
-        f.write(content)
+        f.write(simple_content)
     log.info(f"🧠 Trade logged: {filename}")
 
 
@@ -223,21 +225,36 @@ Return ONLY this JSON:
 
 
 def calculate_confidence(signal_data):
-    prompt = f"""You are a trading analyst. Score this trade signal.
+    # Load past memories so the bot learns from history
+    memory_context = ""
+    if BRAIN_WRITER_AVAILABLE:
+        memories = load_past_memories(limit=10)
+        memory_context = build_memory_context(memories)
+
+    prompt = f"""You are a trading analyst with memory of past trades. Score this signal.
 
 SIGNAL:
 - Symbol: {signal_data['symbol']}
 - Direction: {signal_data['direction']}
 - Strategy: {signal_data['strategy']}
 - Price: ${signal_data['price']:.2f}
+- RSI: {signal_data.get('rsi', 'N/A')}
+- Volume ratio: {signal_data.get('volume_ratio', 'N/A')}x
 - Time: {signal_data['time']}
 - News sentiment: {state['news_sentiment']} ({state['news_score']}/100)
+
+{memory_context}
+
+Based on the signal AND your past trade memories above, score this trade.
+If current conditions match a past failure rule, lower confidence significantly.
+If current conditions match a past success rule, raise confidence.
+Reference specific past rules in your reasoning.
 
 Return ONLY this JSON:
 {{
   "confidence": 75,
   "execute": false,
-  "reasoning": "Explanation here.",
+  "reasoning": "Explanation referencing past memories if relevant.",
   "lesson_if_loss": "What to learn if this loses."
 }}
 
@@ -492,3 +509,14 @@ def run_bot():
 
 if __name__ == "__main__":
     run_bot()
+
+
+# ── Brain Writer Integration ─────────────────────────────────────────────────
+# Import the brain writer for enhanced trade analysis
+try:
+    from brain_writer import write_trade_analysis, load_past_memories, build_memory_context
+    BRAIN_WRITER_AVAILABLE = True
+    log.info("✅ Brain writer loaded")
+except ImportError:
+    BRAIN_WRITER_AVAILABLE = False
+    log.warning("⚠️  Brain writer not available")
