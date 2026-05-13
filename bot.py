@@ -207,7 +207,7 @@ Return ONLY this JSON:
                 "anthropic-version": "2023-06-01"
             },
             json={
-                "model": "claude-sonnet-4-5",
+                "model": "claude-haiku-4-5-20251001",
                 "max_tokens": 300,
                 "messages": [{"role": "user", "content": prompt}]
             }, timeout=30
@@ -280,7 +280,7 @@ execute must be false if confidence < {MIN_CONFIDENCE}."""
                 "anthropic-version": "2023-06-01"
             },
             json={
-                "model": "claude-sonnet-4-5",
+                "model": "claude-haiku-4-5-20251001",
                 "max_tokens": 200,
                 "messages": [{"role": "user", "content": prompt}]
             }, timeout=30
@@ -425,9 +425,11 @@ def check_signal():
         )
 
         if not (strong_buy or strong_sell):
+            log.info(f"📊 No signal — Buy:{buy_signals} Sell:{sell_signals} RSI:{rsi:.1f} MACD:{'✅' if macd > macd_signal_val else '❌'} ADX:{adx:.1f}")
             return None
 
         direction = "LONG" if strong_buy else "SHORT"
+        log.info(f"🔔 {'LONG' if strong_buy else 'SHORT'} signal @ ${current_price:.2f} | RSI:{rsi:.1f} | Buy:{buy_signals} Sell:{sell_signals}")
         return {
             "symbol": SYMBOL,
             "strategy": f"TradingView {recommendation}",
