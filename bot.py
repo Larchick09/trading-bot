@@ -144,45 +144,106 @@ def read_brain_file(filepath):
 
 
 def load_brain():
+    """Load brain from Google Drive if configured, else local files."""
     log.info("🧠 Loading Trading Brain...")
+    
+    gdrive_folder = os.environ.get("GOOGLE_DRIVE_BRAIN_FOLDER_ID", "")
+    
+    if gdrive_folder:
+        log.info("☁️  Loading brain from Google Drive...")
+        _load_brain_from_gdrive(gdrive_folder)
+    else:
+        log.info("📁 Loading brain from local files...")
+        _load_brain_local()
+    
+    log.info("✅ Brain loaded")
+
+
+def _load_brain_from_gdrive(folder_id):
+    """Load brain files directly from Google Drive API."""
+    try:
+        # Get access token from environment
+        gdrive_token = os.environ.get("GDRIVE_TOKEN", "")
+        
+        headers = {}
+        if gdrive_token:
+            headers["Authorization"] = f"Bearer {gdrive_token}"
+        
+        # Map of what to load and where to store it
+        file_map = {
+            "master_rules.md": ("Bot_Rules", "master_rules"),
+            "VWAP_Breakout.md": ("Strategies", "vwap_strategy"),
+            "Opening_Range_Breakout.md": ("Strategies", "orb_strategy"),
+        }
+        
+        brain = {
+            "master_rules": "",
+            "vwap_strategy": "",
+            "orb_strategy": "",
+            "aziz_rules": "",
+            "recent_failures": [],
+            "recent_successes": [],
+        }
+        
+        # Search for each file in Google Drive
+        for filename, (subfolder, brain_key) in file_map.items():
+            try:
+                # Search for the file
+                search_url = "https://www.googleapis.com/drive/v3/files"
+                resp = requests.get(search_url, headers=headers, params={
+                    "q": f"name='{filename}' and '{folder_id}' in parents",
+                    "fields": "files(id,name)"
+                }, timeout=10)
+                
+                files = resp.json().get("files", [])
+                if files:
+                    file_id = files[0]["id"]
+                    # Download file content
+                    dl_url = f"https://www.googleapis.com/drive/v3/files/{file_id}"
+                    dl_resp = requests.get(dl_url, headers=headers, 
+                                          params={"alt": "media"}, timeout=10)
+                    if dl_resp.status_code == 200:
+                        brain[brain_key] = dl_resp.text
+                        log.info(f"☁️  Loaded: {filename}")
+            except Exception as e:
+                log.warning(f"Could not load {filename} from Drive: {e}")
+        
+        # Try to load Aziz strategy
+        try:
+            resp = requests.get("https://www.googleapis.com/drive/v3/files", 
+                headers=headers, params={
+                    "q": f"name contains 'Aziz' and '{folder_id}' in parents",
+                    "fields": "files(id,name)"
+                }, timeout=10)
+            files = resp.json().get("files", [])
+            if files:
+                file_id = files[0]["id"]
+                dl_resp = requests.get(
+                    f"https://www.googleapis.com/drive/v3/files/{file_id}",
+                    headers=headers, params={"alt": "media"}, timeout=10)
+                if dl_resp.status_code == 200:
+                    brain["aziz_rules"] = dl_resp.text[:3000]
+                    log.info("☁️  Loaded: Aziz strategy")
+        except Exception as e:
+            log.warning(f"Could not load Aziz strategy: {e}")
+        
+        state["brain"] = brain
+        
+    except Exception as e:
+        log.error(f"Google Drive brain load failed: {e} — using local files")
+        _load_brain_local()
+
+
+def _load_brain_local():
+    """Load brain from local files on Railway server."""
     state["brain"] = {
         "master_rules": read_brain_file("trading-brain/Bot_Rules/master_rules.md"),
         "vwap_strategy": read_brain_file("trading-brain/Strategies/VWAP_Breakout.md"),
         "orb_strategy": read_brain_file("trading-brain/Strategies/Opening_Range_Breakout.md"),
+        "aziz_rules": "",
         "recent_failures": [],
         "recent_successes": [],
     }
-    log.info("✅ Brain loaded")
-
-
-def log_trade_to_brain(trade_data, outcome):
-    # Add sentiment to trade data
-    trade_data["news_sentiment"] = state["news_sentiment"]
-
-    # Use brain writer for rich analysis if available
-    if BRAIN_WRITER_AVAILABLE:
-        analysis = write_trade_analysis(
-            trade_data, outcome,
-            state["news_sentiment"],
-            state["news_score"]
-        )
-        if analysis:
-            log.info(f"🧠 Brain analysis: {analysis.get('key_lesson', '')}")
-            return
-
-    # Fallback: simple logging
-    now = datetime.now(CT)
-    folder = "trading-brain/Successes" if outcome == "WIN" else "trading-brain/Failures"
-    os.makedirs(folder, exist_ok=True)
-    filename = f"{folder}/{'success' if outcome == 'WIN' else 'failure'}_{now.strftime('%Y%m%d_%H%M%S')}.md"
-    icon = "✅" if outcome == "WIN" else "❌"
-    simple_content = f"""# {icon} {outcome} — {now.strftime('%Y-%m-%d %H:%M CT')}
-- Entry: ${trade_data.get('entry_price', 0):.2f} | Exit: ${trade_data.get('exit_price', 0):.2f}
-- P&L: ${trade_data.get('pnl', 0):.2f} | Confidence: {trade_data.get('confidence', 0)}%
-"""
-    with open(filename, "w") as f:
-        f.write(simple_content)
-    log.info(f"🧠 Trade logged: {filename}")
 
 
 def check_news_and_calendar():
