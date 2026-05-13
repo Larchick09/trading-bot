@@ -293,6 +293,45 @@ execute must be false if confidence < {MIN_CONFIDENCE}."""
         return {"confidence": 0, "execute": False, "reasoning": "Error", "lesson_if_loss": ""}
 
 
+def get_tradingview_analysis(symbol=SYMBOL):
+    """Get full TradingView technical analysis — professional grade signals."""
+    try:
+        from tradingview_ta import TA_Handler, Interval
+        handler = TA_Handler(
+            symbol=symbol,
+            screener="america",
+            exchange="AMEX",
+            interval=Interval.INTERVAL_5_MINUTES
+        )
+        analysis = handler.get_analysis()
+        ind = analysis.indicators
+        summary = analysis.summary
+        return {
+            "recommendation": summary.get("RECOMMENDATION", "NEUTRAL"),
+            "buy_signals": summary.get("BUY", 0),
+            "sell_signals": summary.get("SELL", 0),
+            "neutral_signals": summary.get("NEUTRAL", 0),
+            "rsi": ind.get("RSI", 50),
+            "macd": ind.get("MACD.macd", 0),
+            "macd_signal": ind.get("MACD.signal", 0),
+            "ema20": ind.get("EMA20", 0),
+            "ema50": ind.get("EMA50", 0),
+            "vwap": ind.get("VWAP", 0),
+            "bb_upper": ind.get("BB.upper", 0),
+            "bb_lower": ind.get("BB.lower", 0),
+            "volume": ind.get("volume", 0),
+            "close": ind.get("close", 0),
+            "adx": ind.get("ADX", 0),
+            "stoch_k": ind.get("Stoch.K", 50),
+        }
+    except ImportError:
+        log.warning("tradingview-ta not installed")
+        return None
+    except Exception as e:
+        log.error(f"TradingView error: {e}")
+        return None
+
+
 def calculate_rsi(prices, period=14):
     if len(prices) < period + 1:
         return 50
@@ -321,6 +360,7 @@ def get_bars(symbol=SYMBOL, limit=50):
 
 
 def check_signal():
+    """Check for trading signal using TradingView analysis + Alpaca fallback."""
     now = datetime.now(CT)
     hour, minute = now.hour, now.minute
 
@@ -331,6 +371,63 @@ def check_signal():
     if (hour, minute) > (15, 30):
         return None
 
+    # Try TradingView first — much richer data
+    tv = get_tradingview_analysis()
+
+    if tv and tv["close"] > 0:
+        current_price = tv["close"]
+        rsi = tv["rsi"]
+        vwap = tv["vwap"]
+        recommendation = tv["recommendation"]
+        buy_signals = tv["buy_signals"]
+        sell_signals = tv["sell_signals"]
+        macd = tv["macd"]
+        macd_signal_val = tv["macd_signal"]
+        adx = tv["adx"]
+
+        log.info(f"📊 TradingView: {recommendation} | RSI:{rsi:.1f} | "
+                 f"Buy:{buy_signals} Sell:{sell_signals} | ADX:{adx:.1f}")
+
+        strong_buy = (
+            recommendation in ["STRONG_BUY", "BUY"] and
+            buy_signals >= 8 and
+            50 < rsi < 70 and
+            macd > macd_signal_val and
+            current_price > vwap and
+            adx > 20
+        )
+
+        strong_sell = (
+            recommendation in ["STRONG_SELL", "SELL"] and
+            sell_signals >= 8 and
+            30 < rsi < 50 and
+            macd < macd_signal_val and
+            current_price < vwap and
+            adx > 20
+        )
+
+        if not (strong_buy or strong_sell):
+            return None
+
+        direction = "LONG" if strong_buy else "SHORT"
+        return {
+            "symbol": SYMBOL,
+            "strategy": f"TradingView {recommendation}",
+            "direction": direction,
+            "price": current_price,
+            "vwap": round(vwap, 2),
+            "rsi": round(rsi, 1),
+            "volume_ratio": round(tv["volume"] / 1000000, 2),
+            "buy_signals": buy_signals,
+            "sell_signals": sell_signals,
+            "macd": round(macd, 4),
+            "adx": round(adx, 1),
+            "time": now.strftime("%H:%M CT"),
+            "tv_recommendation": recommendation,
+        }
+
+    # Fallback: Alpaca VWAP crossover
+    log.info("📊 TradingView unavailable — using Alpaca fallback")
     bars = get_bars()
     if len(bars) < 20:
         return None
@@ -338,25 +435,18 @@ def check_signal():
     closes = [b["c"] for b in bars]
     volumes = [b["v"] for b in bars]
     current_price = closes[-1]
-
     total_vol = sum(volumes)
     vwap = sum(c * v for c, v in zip(closes, volumes)) / total_vol if total_vol > 0 else current_price
     rsi = calculate_rsi(closes)
-
     avg_vol = sum(volumes[:-1]) / len(volumes[:-1]) if len(volumes) > 1 else 1
     vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 0
-
     prev_price = closes[-2] if len(closes) >= 2 else current_price
     crossed_above = prev_price < vwap and current_price > vwap
     crossed_below = prev_price > vwap and current_price < vwap
-
     if not (crossed_above or crossed_below):
         return None
-
     if vol_ratio < 1.3:
-        log.info(f"⚠️  Signal but low volume ({vol_ratio:.1f}x)")
         return None
-
     direction = "LONG" if crossed_above else "SHORT"
     return {
         "symbol": SYMBOL,
