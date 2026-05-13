@@ -207,7 +207,7 @@ Return ONLY this JSON:
                 "anthropic-version": "2023-06-01"
             },
             json={
-                "model": "claude-sonnet-4-20250514",
+                "model": "claude-sonnet-4-5",
                 "max_tokens": 300,
                 "messages": [{"role": "user", "content": prompt}]
             }, timeout=30
@@ -280,7 +280,7 @@ execute must be false if confidence < {MIN_CONFIDENCE}."""
                 "anthropic-version": "2023-06-01"
             },
             json={
-                "model": "claude-sonnet-4-20250514",
+                "model": "claude-sonnet-4-5",
                 "max_tokens": 200,
                 "messages": [{"role": "user", "content": prompt}]
             }, timeout=30
