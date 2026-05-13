@@ -50,6 +50,10 @@ state = {
     "connected": False
 }
 
+# ── Feature flags (set defaults, overridden by imports below) ────────────────
+BRAIN_WRITER_AVAILABLE = False
+MORNING_BRIEF_AVAILABLE = False
+
 
 def alpaca_headers():
     return {
@@ -297,13 +301,25 @@ def get_tradingview_analysis(symbol=SYMBOL):
     """Get full TradingView technical analysis — professional grade signals."""
     try:
         from tradingview_ta import TA_Handler, Interval
-        handler = TA_Handler(
-            symbol=symbol,
-            screener="america",
-            exchange="AMEX",
-            interval=Interval.INTERVAL_5_MINUTES
-        )
-        analysis = handler.get_analysis()
+        # Try multiple exchanges since SPY can appear on different ones
+        for exchange in ["AMEX", "NYSE", "ARCA"]:
+            try:
+                handler = TA_Handler(
+                    symbol=symbol,
+                    screener="america",
+                    exchange=exchange,
+                    interval=Interval.INTERVAL_5_MINUTES
+                )
+                analysis = handler.get_analysis()
+                close_price = analysis.indicators.get("close", 0)
+                # SPY should be between $500-700, reject if way off
+                if symbol == "SPY" and (close_price < 400 or close_price > 800):
+                    log.warning(f"SPY price {close_price} looks wrong on {exchange}, trying next")
+                    continue
+                log.info(f"✅ TradingView connected via {exchange}")
+                break
+            except Exception:
+                continue
         ind = analysis.indicators
         summary = analysis.summary
         return {
