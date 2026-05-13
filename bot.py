@@ -411,7 +411,7 @@ def check_signal():
         strong_buy = (
             recommendation in ["STRONG_BUY", "BUY"] and
             buy_signals >= 10 and
-            45 < rsi < 75 and
+            rsi > 45 and
             macd > macd_signal_val and
             adx > 20
         )
@@ -419,7 +419,7 @@ def check_signal():
         strong_sell = (
             recommendation in ["STRONG_SELL", "SELL"] and
             sell_signals >= 10 and
-            25 < rsi < 55 and
+            rsi < 55 and
             macd < macd_signal_val and
             adx > 20
         )
