@@ -236,42 +236,21 @@ Return ONLY this JSON:
 
 
 def calculate_confidence(signal_data):
-    # Load past memories so the bot learns from history
-    memory_context = ""
-    if BRAIN_WRITER_AVAILABLE:
-        memories = load_past_memories(limit=10)
-        memory_context = build_memory_context(memories)
-
-    prompt = f"""You are a trading analyst with memory of past trades. Score this signal.
-
-SIGNAL:
-- Symbol: {signal_data['symbol']}
-- Direction: {signal_data['direction']}
-- Strategy: {signal_data['strategy']}
-- Price: ${signal_data['price']:.2f}
-- RSI: {signal_data.get('rsi', 'N/A')}
-- Volume ratio: {signal_data.get('volume_ratio', 'N/A')}x
-- Time: {signal_data['time']}
-- News sentiment: {state['news_sentiment']} ({state['news_score']}/100)
-
-{memory_context}
-
-Based on the signal AND your past trade memories above, score this trade.
-If current conditions match a past failure rule, lower confidence significantly.
-If current conditions match a past success rule, raise confidence.
-Reference specific past rules in your reasoning.
-
-Return ONLY this JSON:
-{{
-  "confidence": 75,
-  "execute": false,
-  "reasoning": "Explanation referencing past memories if relevant.",
-  "lesson_if_loss": "What to learn if this loses."
-}}
-
-execute must be false if confidence < {MIN_CONFIDENCE}."""
-
+    """Score a trade signal using Claude."""
     try:
+        # Simple prompt that won't cause JSON issues
+        prompt = (
+            "Score this trading signal from 0-100. "
+            "Direction: " + signal_data.get('direction', 'LONG') + ". "
+            "SPY price: " + str(signal_data.get('price', 0)) + ". "
+            "RSI: " + str(signal_data.get('rsi', 50)) + ". "
+            "Buy signals: " + str(signal_data.get('buy_signals', 0)) + " of 16. "
+            "ADX: " + str(signal_data.get('adx', 0)) + ". "
+            "News: " + state.get('news_sentiment', 'neutral') + ". "
+            "Reply with ONLY this format, no other text: "
+            '{"confidence": 85, "execute": true, "reasoning": "reason here", "lesson_if_loss": "lesson"}'
+        )
+
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -281,31 +260,96 @@ execute must be false if confidence < {MIN_CONFIDENCE}."""
             },
             json={
                 "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 200,
+                "max_tokens": 100,
                 "messages": [{"role": "user", "content": prompt}]
-            }, timeout=30
+            },
+            timeout=15
         )
+
         resp_json = resp.json()
         if "content" not in resp_json:
-            log.error(f"Confidence API error: {resp_json.get('error', {}).get('message', str(resp_json))}")
-            return {"confidence": 0, "execute": False, "reasoning": "API error", "lesson_if_loss": ""}
-        text = resp_json["content"][0]["text"]
-        # Clean the response thoroughly before parsing
-        text = text.replace("```json", "").replace("```", "").strip()
-        # Find JSON object
+            log.warning(f"API issue: {resp_json}")
+            return _fallback_confidence(signal_data)
+
+        text = resp_json["content"][0]["text"].strip()
+
+        # Extract just the JSON object
         start = text.find("{")
         end = text.rfind("}") + 1
-        if start >= 0 and end > start:
-            text = text[start:end]
-        result = json.loads(text)
-        confidence = result.get("confidence", 0)
-        execute = result.get("execute", False) and confidence >= MIN_CONFIDENCE
+        if start == -1 or end == 0:
+            log.warning(f"No JSON found in: {text[:100]}")
+            return _fallback_confidence(signal_data)
+
+        json_str = text[start:end]
+
+        # Fix common JSON issues — remove newlines inside strings
+        import re
+        # Replace any special chars that break JSON
+        json_str = re.sub(r'[\n\r\t]', ' ', json_str)
+        # Remove non-ASCII
+        json_str = json_str.encode('ascii', 'ignore').decode('ascii')
+
+        result = json.loads(json_str)
+        confidence = int(result.get("confidence", 0))
+        execute = confidence >= MIN_CONFIDENCE
+
         log.info(f"🧠 Brain: {confidence}% — {'✅ EXECUTE' if execute else '❌ SKIP'}")
-        log.info(f"🧠 {result.get('reasoning', '')}")
-        return {**result, "execute": execute}
+        log.info(f"🧠 {str(result.get('reasoning', ''))[:80]}")
+        return {**result, "execute": execute, "confidence": confidence}
+
+    except json.JSONDecodeError as e:
+        log.warning(f"JSON parse failed: {e} — using fallback")
+        return _fallback_confidence(signal_data)
     except Exception as e:
-        log.error(f"Confidence error: {e}")
-        return {"confidence": 0, "execute": False, "reasoning": "Error", "lesson_if_loss": ""}
+        log.warning(f"Confidence error: {e} — using fallback")
+        return _fallback_confidence(signal_data)
+
+
+def _fallback_confidence(signal_data):
+    """
+    Calculate confidence from signal strength alone when Claude API fails.
+    This ensures the bot still trades even if AI scoring is unavailable.
+    """
+    buy_signals = signal_data.get('buy_signals', 0)
+    sell_signals = signal_data.get('sell_signals', 0)
+    rsi = signal_data.get('rsi', 50)
+    adx = signal_data.get('adx', 0)
+    recommendation = signal_data.get('tv_recommendation', 'NEUTRAL')
+    direction = signal_data.get('direction', 'LONG')
+
+    # Base score from indicator consensus
+    total = buy_signals + sell_signals
+    if total == 0:
+        return {"confidence": 0, "execute": False, "reasoning": "No signals", "lesson_if_loss": ""}
+
+    if direction == "LONG":
+        consensus = (buy_signals / total) * 100
+    else:
+        consensus = (sell_signals / total) * 100
+
+    # Adjust for recommendation strength
+    if recommendation == "STRONG_BUY" and direction == "LONG":
+        consensus += 10
+    elif recommendation == "STRONG_SELL" and direction == "SHORT":
+        consensus += 10
+
+    # Adjust for ADX (trend strength)
+    if adx > 40:
+        consensus += 8
+    elif adx > 25:
+        consensus += 4
+
+    # Cap at 95
+    confidence = min(int(consensus), 95)
+    execute = confidence >= MIN_CONFIDENCE
+
+    log.info(f"🧠 Fallback confidence: {confidence}% — {'✅ EXECUTE' if execute else '❌ SKIP'}")
+    return {
+        "confidence": confidence,
+        "execute": execute,
+        "reasoning": f"Fallback scoring: {buy_signals} buy signals, ADX {adx:.1f}",
+        "lesson_if_loss": "Review signal quality"
+    }
 
 
 def get_tradingview_analysis(symbol=SYMBOL):
