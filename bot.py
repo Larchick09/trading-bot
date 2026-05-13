@@ -290,7 +290,14 @@ execute must be false if confidence < {MIN_CONFIDENCE}."""
             log.error(f"Confidence API error: {resp_json.get('error', {}).get('message', str(resp_json))}")
             return {"confidence": 0, "execute": False, "reasoning": "API error", "lesson_if_loss": ""}
         text = resp_json["content"][0]["text"]
-        result = json.loads(text.replace("```json", "").replace("```", "").strip())
+        # Clean the response thoroughly before parsing
+        text = text.replace("```json", "").replace("```", "").strip()
+        # Find JSON object
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start >= 0 and end > start:
+            text = text[start:end]
+        result = json.loads(text)
         confidence = result.get("confidence", 0)
         execute = result.get("execute", False) and confidence >= MIN_CONFIDENCE
         log.info(f"🧠 Brain: {confidence}% — {'✅ EXECUTE' if execute else '❌ SKIP'}")
