@@ -236,19 +236,24 @@ Return ONLY this JSON:
 
 
 def calculate_confidence(signal_data):
-    """Score a trade signal using Claude."""
+    """Score a trade signal using Claude with structured output."""
     try:
-        # Simple prompt that won't cause JSON issues
-        prompt = (
-            "Score this trading signal from 0-100. "
-            "Direction: " + signal_data.get('direction', 'LONG') + ". "
-            "SPY price: " + str(signal_data.get('price', 0)) + ". "
-            "RSI: " + str(signal_data.get('rsi', 50)) + ". "
-            "Buy signals: " + str(signal_data.get('buy_signals', 0)) + " of 16. "
-            "ADX: " + str(signal_data.get('adx', 0)) + ". "
-            "News: " + state.get('news_sentiment', 'neutral') + ". "
-            "Reply with ONLY this format, no other text: "
-            '{"confidence": 85, "execute": true, "reasoning": "reason here", "lesson_if_loss": "lesson"}'
+        system_prompt = (
+            "You are a trading analysis agent. "
+            "You must ALWAYS respond with a JSON object and nothing else. "
+            "No explanation before or after. No markdown. Pure JSON only. "
+            'Format: {"confidence": 85, "execute": true, "reasoning": "brief reason", "lesson_if_loss": "brief lesson"} '
+            "confidence is 0-100. execute is true only if confidence >= 80."
+        )
+
+        user_msg = (
+            "Score this trade: "
+            + signal_data.get('direction', 'LONG')
+            + " SPY. RSI=" + str(round(signal_data.get('rsi', 50), 1))
+            + " BuySignals=" + str(signal_data.get('buy_signals', 0))
+            + "/16 ADX=" + str(round(signal_data.get('adx', 0), 1))
+            + " News=" + state.get('news_sentiment', 'neutral')
+            + ". Reply with JSON only."
         )
 
         resp = requests.post(
@@ -260,48 +265,40 @@ def calculate_confidence(signal_data):
             },
             json={
                 "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 100,
-                "messages": [{"role": "user", "content": prompt}]
+                "max_tokens": 80,
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": user_msg}]
             },
             timeout=15
         )
 
         resp_json = resp.json()
         if "content" not in resp_json:
-            log.warning(f"API issue: {resp_json}")
+            log.warning(f"API issue — fallback")
             return _fallback_confidence(signal_data)
 
         text = resp_json["content"][0]["text"].strip()
-
-        # Extract just the JSON object
+        
+        # Extract JSON
         start = text.find("{")
         end = text.rfind("}") + 1
         if start == -1 or end == 0:
-            log.warning(f"No JSON found in: {text[:100]}")
             return _fallback_confidence(signal_data)
 
-        json_str = text[start:end]
-
-        # Fix common JSON issues — remove newlines inside strings
         import re
-        # Replace any special chars that break JSON
+        json_str = text[start:end]
         json_str = re.sub(r'[\n\r\t]', ' ', json_str)
-        # Remove non-ASCII
         json_str = json_str.encode('ascii', 'ignore').decode('ascii')
 
         result = json.loads(json_str)
         confidence = int(result.get("confidence", 0))
         execute = confidence >= MIN_CONFIDENCE
 
-        log.info(f"🧠 Brain: {confidence}% — {'✅ EXECUTE' if execute else '❌ SKIP'}")
-        log.info(f"🧠 {str(result.get('reasoning', ''))[:80]}")
+        log.info(f"Brain: {confidence}% — {'EXECUTE' if execute else 'SKIP'}")
         return {**result, "execute": execute, "confidence": confidence}
 
-    except json.JSONDecodeError as e:
-        log.warning(f"JSON parse failed: {e} — using fallback")
-        return _fallback_confidence(signal_data)
     except Exception as e:
-        log.warning(f"Confidence error: {e} — using fallback")
+        log.warning(f"Confidence error: {e} — fallback")
         return _fallback_confidence(signal_data)
 
 
@@ -456,8 +453,15 @@ def check_signal():
         macd_signal_val = tv["macd_signal"]
         adx = tv["adx"]
 
+        # Detect ranging/choppy market — skip if ADX too low
+        if adx < 20:
+            log.info(f"📊 RANGING MARKET detected (ADX:{adx:.1f} < 20) — skipping all signals")
+            log.info(f"📊 Choppy market: price bouncing sideways, breakouts unreliable")
+            return None
+
+        market_type = "TRENDING" if adx > 25 else "WEAK TREND"
         log.info(f"📊 TradingView: {recommendation} | RSI:{rsi:.1f} | "
-                 f"Buy:{buy_signals} Sell:{sell_signals} | ADX:{adx:.1f}")
+                 f"Buy:{buy_signals} Sell:{sell_signals} | ADX:{adx:.1f} | {market_type}")
 
         strong_buy = (
             recommendation in ["STRONG_BUY", "BUY"] and
@@ -642,10 +646,31 @@ def trading_loop():
 
 
 def end_of_day():
-    log.info("🚪 END OF DAY")
+    log.info("🚪 END OF DAY — Closing all positions")
+    
+    # Close tracked position
     if state["position"]:
-        close_position(state["position"]["symbol"])
-    send_alert(f"📊 Day done! P&L: ${state['daily_pnl']:.2f} | Trades: {state['trades_today']}")
+        symbol = state["position"]["symbol"]
+        log.info(f"Closing tracked position: {symbol}")
+        close_position(symbol)
+    
+    # Also force-close any open positions on Alpaca directly
+    try:
+        resp = requests.delete(
+            f"{ALPACA_BASE_URL}/positions",
+            headers=alpaca_headers(),
+            timeout=10
+        )
+        if resp.status_code in [200, 204, 207]:
+            log.info("✅ All Alpaca positions closed")
+        else:
+            log.warning(f"Position close response: {resp.status_code}")
+    except Exception as e:
+        log.error(f"Error closing all positions: {e}")
+
+    summary = f"📊 Day done! P&L: ${state['daily_pnl']:.2f} | Trades: {state['trades_today']}"
+    send_alert(summary)
+    log.info(summary)
     log.info("=" * 60)
 
 
