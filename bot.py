@@ -285,7 +285,11 @@ execute must be false if confidence < {MIN_CONFIDENCE}."""
                 "messages": [{"role": "user", "content": prompt}]
             }, timeout=30
         )
-        text = resp.json()["content"][0]["text"]
+        resp_json = resp.json()
+        if "content" not in resp_json:
+            log.error(f"Confidence API error: {resp_json.get('error', {}).get('message', str(resp_json))}")
+            return {"confidence": 0, "execute": False, "reasoning": "API error", "lesson_if_loss": ""}
+        text = resp_json["content"][0]["text"]
         result = json.loads(text.replace("```json", "").replace("```", "").strip())
         confidence = result.get("confidence", 0)
         execute = result.get("execute", False) and confidence >= MIN_CONFIDENCE
