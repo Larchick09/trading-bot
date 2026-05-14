@@ -50,9 +50,23 @@ state = {
     "connected": False
 }
 
-# ── Feature flags (set defaults, overridden by imports below) ────────────────
+# ── Feature flags ────────────────────────────────────────────────────────────
 BRAIN_WRITER_AVAILABLE = False
 MORNING_BRIEF_AVAILABLE = False
+
+# ── Brain Writer Integration ──────────────────────────────────────────────────
+try:
+    from brain_writer import write_trade_analysis, load_past_memories, build_memory_context
+    BRAIN_WRITER_AVAILABLE = True
+except ImportError:
+    pass
+
+# ── Morning Brief Integration ─────────────────────────────────────────────────
+try:
+    from morning_brief import run_morning_brief, get_todays_brief
+    MORNING_BRIEF_AVAILABLE = True
+except ImportError:
+    pass
 
 
 def alpaca_headers():
@@ -594,6 +608,40 @@ def check_signal():
     }
 
 
+def log_trade_to_brain(trade_data, outcome):
+    """Log completed trade to brain for learning."""
+    now = datetime.now(CT)
+    folder = "trading-brain/Successes" if outcome == "WIN" else "trading-brain/Failures"
+    os.makedirs(folder, exist_ok=True)
+    filename = f"{folder}/{'success' if outcome == 'WIN' else 'failure'}_{now.strftime('%Y%m%d_%H%M%S')}.md"
+    icon = "✅" if outcome == "WIN" else "❌"
+    simple_content = f"""# {icon} {outcome} — {now.strftime('%Y-%m-%d %H:%M CT')}
+## Trade Details
+- Direction: {trade_data.get('direction', 'N/A')}
+- Entry: ${trade_data.get('entry_price', 0):.2f}
+- Exit: ${trade_data.get('exit_price', 0):.2f}
+- P&L: ${trade_data.get('pnl', 0):.2f}
+- Confidence: {trade_data.get('confidence', 0)}%
+- RSI: {trade_data.get('rsi', 'N/A')}
+- ADX: {trade_data.get('adx', 'N/A')}
+- Time: {trade_data.get('time', 'N/A')}
+
+## Lesson
+{trade_data.get('lesson', 'Review this trade.')}
+"""
+    with open(filename, "w") as f:
+        f.write(simple_content)
+    log.info(f"🧠 Trade logged: {filename}")
+
+    if BRAIN_WRITER_AVAILABLE:
+        try:
+            write_trade_analysis(trade_data, outcome,
+                                 state.get('news_sentiment', 'neutral'),
+                                 state.get('news_score', 50))
+        except Exception as e:
+            log.warning(f"Brain writer error: {e}")
+
+
 def check_risk_limits():
     if state["trades_today"] >= MAX_TRADES_PER_DAY:
         log.warning(f"⛔ Max trades reached")
@@ -763,20 +811,4 @@ if __name__ == "__main__":
     run_bot()
 
 
-# ── Brain Writer Integration ─────────────────────────────────────────────────
-try:
-    from brain_writer import write_trade_analysis, load_past_memories, build_memory_context
-    BRAIN_WRITER_AVAILABLE = True
-    log.info("✅ Brain writer loaded")
-except ImportError:
-    BRAIN_WRITER_AVAILABLE = False
-    log.warning("⚠️  Brain writer not available")
 
-# ── Morning Brief Integration ─────────────────────────────────────────────────
-try:
-    from morning_brief import run_morning_brief, get_todays_brief
-    MORNING_BRIEF_AVAILABLE = True
-    log.info("✅ Morning brief loaded")
-except ImportError:
-    MORNING_BRIEF_AVAILABLE = False
-    log.warning("⚠️  Morning brief not available")
