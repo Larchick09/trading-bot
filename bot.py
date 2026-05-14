@@ -8,6 +8,7 @@
 """
 
 import os
+import re
 import json
 import time
 import logging
@@ -22,9 +23,9 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 log = logging.getLogger("TradingBot")
-
 CT = ZoneInfo("America/Chicago")
 
+# ── API Keys (from Railway environment variables) ─────────────────────────────
 ALPACA_API_KEY    = os.environ.get("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
 ALPACA_BASE_URL   = "https://paper-api.alpaca.markets/v2"
@@ -32,12 +33,14 @@ CLAUDE_API_KEY    = os.environ.get("CLAUDE_API_KEY", "")
 PUSHOVER_TOKEN    = os.environ.get("PUSHOVER_TOKEN", "")
 PUSHOVER_USER     = os.environ.get("PUSHOVER_USER", "")
 
+# ── Bot Settings ──────────────────────────────────────────────────────────────
 MAX_TRADES_PER_DAY = 5
 MAX_DAILY_LOSS     = 200.00
 MIN_CONFIDENCE     = 80
 SYMBOL             = "SPY"
 QTY                = 2
 
+# ── Bot State ─────────────────────────────────────────────────────────────────
 state = {
     "trades_today": 0,
     "daily_pnl": 0.0,
@@ -50,24 +53,28 @@ state = {
     "connected": False
 }
 
-# ── Feature flags ────────────────────────────────────────────────────────────
+# ── Feature Flags ─────────────────────────────────────────────────────────────
 BRAIN_WRITER_AVAILABLE = False
 MORNING_BRIEF_AVAILABLE = False
 
-# ── Brain Writer Integration ──────────────────────────────────────────────────
+# Load brain writer if available
 try:
     from brain_writer import write_trade_analysis, load_past_memories, build_memory_context
     BRAIN_WRITER_AVAILABLE = True
 except ImportError:
     pass
 
-# ── Morning Brief Integration ─────────────────────────────────────────────────
+# Load morning brief if available
 try:
     from morning_brief import run_morning_brief, get_todays_brief
     MORNING_BRIEF_AVAILABLE = True
 except ImportError:
     pass
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ALPACA FUNCTIONS
+# ══════════════════════════════════════════════════════════════════════════════
 
 def alpaca_headers():
     return {
@@ -89,7 +96,7 @@ def alpaca_connect():
             state["connected"] = True
             return True
         else:
-            log.error(f"❌ Alpaca failed: {resp.status_code} {resp.text}")
+            log.error(f"❌ Alpaca failed: {resp.status_code}")
             return False
     except Exception as e:
         log.error(f"❌ Alpaca error: {e}")
@@ -127,9 +134,8 @@ def place_order(direction, symbol=SYMBOL):
             }, timeout=10
         )
         if resp.status_code in [200, 201]:
-            order = resp.json()
             log.info(f"✅ Order: {side.upper()} {QTY}x {symbol}")
-            return order
+            return resp.json()
         else:
             log.error(f"❌ Order failed: {resp.text}")
     except Exception as e:
@@ -150,6 +156,10 @@ def close_position(symbol=SYMBOL):
         log.error(f"Close error: {e}")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  BRAIN / GOOGLE DRIVE
+# ══════════════════════════════════════════════════════════════════════════════
+
 def read_brain_file(filepath):
     if os.path.exists(filepath):
         with open(filepath) as f:
@@ -158,38 +168,24 @@ def read_brain_file(filepath):
 
 
 def load_brain():
-    """Load brain from Google Drive if configured, else local files."""
     log.info("🧠 Loading Trading Brain...")
-    
     gdrive_folder = os.environ.get("GOOGLE_DRIVE_BRAIN_FOLDER_ID", "")
-    
     if gdrive_folder:
         log.info("☁️  Loading brain from Google Drive...")
         _load_brain_from_gdrive(gdrive_folder)
     else:
         log.info("📁 Loading brain from local files...")
         _load_brain_local()
-    
     log.info("✅ Brain loaded")
 
 
 def _load_brain_from_gdrive(folder_id):
-    """Load brain files directly from Google Drive API."""
     try:
-        # Get access token from environment
         gdrive_token = os.environ.get("GDRIVE_TOKEN", "")
-        
         headers = {}
         if gdrive_token:
             headers["Authorization"] = f"Bearer {gdrive_token}"
-        
-        # Map of what to load and where to store it
-        file_map = {
-            "master_rules.md": ("Bot_Rules", "master_rules"),
-            "VWAP_Breakout.md": ("Strategies", "vwap_strategy"),
-            "Opening_Range_Breakout.md": ("Strategies", "orb_strategy"),
-        }
-        
+
         brain = {
             "master_rules": "",
             "vwap_strategy": "",
@@ -198,58 +194,64 @@ def _load_brain_from_gdrive(folder_id):
             "recent_failures": [],
             "recent_successes": [],
         }
-        
-        # Search for each file in Google Drive
-        for filename, (subfolder, brain_key) in file_map.items():
+
+        file_map = {
+            "master_rules.md": "master_rules",
+            "VWAP_Breakout.md": "vwap_strategy",
+            "Opening_Range_Breakout.md": "orb_strategy",
+        }
+
+        for filename, brain_key in file_map.items():
             try:
-                # Search for the file
-                search_url = "https://www.googleapis.com/drive/v3/files"
-                resp = requests.get(search_url, headers=headers, params={
-                    "q": f"name='{filename}' and '{folder_id}' in parents",
-                    "fields": "files(id,name)"
-                }, timeout=10)
-                
+                resp = requests.get(
+                    "https://www.googleapis.com/drive/v3/files",
+                    headers=headers,
+                    params={"q": f"name='{filename}' and '{folder_id}' in parents",
+                            "fields": "files(id,name)"},
+                    timeout=10
+                )
                 files = resp.json().get("files", [])
                 if files:
                     file_id = files[0]["id"]
-                    # Download file content
-                    dl_url = f"https://www.googleapis.com/drive/v3/files/{file_id}"
-                    dl_resp = requests.get(dl_url, headers=headers, 
-                                          params={"alt": "media"}, timeout=10)
-                    if dl_resp.status_code == 200:
-                        brain[brain_key] = dl_resp.text
+                    dl = requests.get(
+                        f"https://www.googleapis.com/drive/v3/files/{file_id}",
+                        headers=headers, params={"alt": "media"}, timeout=10
+                    )
+                    if dl.status_code == 200:
+                        brain[brain_key] = dl.text
                         log.info(f"☁️  Loaded: {filename}")
             except Exception as e:
-                log.warning(f"Could not load {filename} from Drive: {e}")
-        
-        # Try to load Aziz strategy
+                log.warning(f"Could not load {filename}: {e}")
+
+        # Load Aziz strategy
         try:
-            resp = requests.get("https://www.googleapis.com/drive/v3/files", 
-                headers=headers, params={
-                    "q": f"name contains 'Aziz' and '{folder_id}' in parents",
-                    "fields": "files(id,name)"
-                }, timeout=10)
+            resp = requests.get(
+                "https://www.googleapis.com/drive/v3/files",
+                headers=headers,
+                params={"q": f"name contains 'Aziz' and '{folder_id}' in parents",
+                        "fields": "files(id,name)"},
+                timeout=10
+            )
             files = resp.json().get("files", [])
             if files:
-                file_id = files[0]["id"]
-                dl_resp = requests.get(
-                    f"https://www.googleapis.com/drive/v3/files/{file_id}",
-                    headers=headers, params={"alt": "media"}, timeout=10)
-                if dl_resp.status_code == 200:
-                    brain["aziz_rules"] = dl_resp.text[:3000]
+                dl = requests.get(
+                    f"https://www.googleapis.com/drive/v3/files/{files[0]['id']}",
+                    headers=headers, params={"alt": "media"}, timeout=10
+                )
+                if dl.status_code == 200:
+                    brain["aziz_rules"] = dl.text[:3000]
                     log.info("☁️  Loaded: Aziz strategy")
         except Exception as e:
             log.warning(f"Could not load Aziz strategy: {e}")
-        
+
         state["brain"] = brain
-        
+
     except Exception as e:
         log.error(f"Google Drive brain load failed: {e} — using local files")
         _load_brain_local()
 
 
 def _load_brain_local():
-    """Load brain from local files on Railway server."""
     state["brain"] = {
         "master_rules": read_brain_file("trading-brain/Bot_Rules/master_rules.md"),
         "vwap_strategy": read_brain_file("trading-brain/Strategies/VWAP_Breakout.md"),
@@ -260,19 +262,57 @@ def _load_brain_local():
     }
 
 
+def log_trade_to_brain(trade_data, outcome):
+    """Log completed trade to brain files for learning."""
+    now = datetime.now(CT)
+    folder = "trading-brain/Successes" if outcome == "WIN" else "trading-brain/Failures"
+    os.makedirs(folder, exist_ok=True)
+    filename = f"{folder}/{'success' if outcome == 'WIN' else 'failure'}_{now.strftime('%Y%m%d_%H%M%S')}.md"
+    icon = "✅" if outcome == "WIN" else "❌"
+    content = f"""# {icon} {outcome} — {now.strftime('%Y-%m-%d %H:%M CT')}
+## Trade Details
+- Direction: {trade_data.get('direction', 'N/A')}
+- Strategy: {trade_data.get('strategy', 'N/A')}
+- Entry: ${trade_data.get('entry_price', 0):.2f}
+- Exit: ${trade_data.get('exit_price', 0):.2f}
+- P&L: ${trade_data.get('pnl', 0):.2f}
+- Confidence: {trade_data.get('confidence', 0)}%
+- RSI: {trade_data.get('rsi', 'N/A')}
+- ADX: {trade_data.get('adx', 'N/A')}
+- Buy Signals: {trade_data.get('buy_signals', 'N/A')}
+- Time: {trade_data.get('time', 'N/A')}
+
+## Lesson
+{trade_data.get('lesson', 'Review this trade.')}
+"""
+    with open(filename, "w") as f:
+        f.write(content)
+    log.info(f"🧠 Trade logged: {filename}")
+
+    if BRAIN_WRITER_AVAILABLE:
+        try:
+            write_trade_analysis(
+                trade_data, outcome,
+                state.get('news_sentiment', 'neutral'),
+                state.get('news_score', 50)
+            )
+        except Exception as e:
+            log.warning(f"Brain writer error: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  NEWS & CALENDAR CHECK
+# ══════════════════════════════════════════════════════════════════════════════
+
 def check_news_and_calendar():
     log.info("📰 Checking news and calendar...")
     today = datetime.now(CT).strftime("%Y-%m-%d")
-    prompt = f"""You are a trading risk analyst. Today is {today}.
-Are there major economic events today that make US stock trading risky?
-Return ONLY this JSON:
-{{
-  "skip_day": false,
-  "skip_reason": "",
-  "sentiment": "neutral",
-  "sentiment_score": 50,
-  "news_summary": "Market conditions summary here."
-}}"""
+    prompt = (
+        f"You are a trading risk analyst. Today is {today}. "
+        "Are there major economic events today that make US stock trading risky? "
+        'Return ONLY this JSON: {"skip_day": false, "skip_reason": "", '
+        '"sentiment": "neutral", "sentiment_score": 50, "news_summary": "brief summary"}'
+    )
     try:
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -283,26 +323,24 @@ Return ONLY this JSON:
             },
             json={
                 "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 300,
+                "max_tokens": 200,
                 "messages": [{"role": "user", "content": prompt}]
             }, timeout=30
         )
         resp_json = resp.json()
         if "content" not in resp_json:
-            log.error(f"News API error: {resp_json.get('error', {}).get('message', str(resp_json))}")
-            state["skip_day"] = False
-            state["news_sentiment"] = "neutral"
-            state["news_score"] = 50
-            return
+            raise Exception(f"No content in response: {resp_json}")
         text = resp_json["content"][0]["text"]
-        data = json.loads(text.replace("```json", "").replace("```", "").strip())
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        data = json.loads(text[start:end])
         state["skip_day"] = data.get("skip_day", False)
         state["news_sentiment"] = data.get("sentiment", "neutral")
         state["news_score"] = data.get("sentiment_score", 50)
         if state["skip_day"]:
             log.warning(f"⚠️  SKIP DAY: {data.get('skip_reason')}")
         else:
-            log.info(f"📰 Sentiment: {state['news_sentiment']} | {data.get('news_summary', '')}")
+            log.info(f"📰 Sentiment: {state['news_sentiment']} ({state['news_score']}/100)")
     except Exception as e:
         log.error(f"News error: {e}")
         state["skip_day"] = False
@@ -310,8 +348,12 @@ Return ONLY this JSON:
         state["news_score"] = 50
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONFIDENCE SCORING
+# ══════════════════════════════════════════════════════════════════════════════
+
 def calculate_confidence(signal_data):
-    """Score a trade signal using Claude with structured output."""
+    """Score a trade signal using Claude. Falls back to math if API fails."""
     try:
         system_prompt = (
             "You are a trading analysis agent. "
@@ -320,7 +362,6 @@ def calculate_confidence(signal_data):
             'Format: {"confidence": 85, "execute": true, "reasoning": "brief reason", "lesson_if_loss": "brief lesson"} '
             "confidence is 0-100. execute is true only if confidence >= 80."
         )
-
         user_msg = (
             "Score this trade: "
             + signal_data.get('direction', 'LONG')
@@ -330,7 +371,6 @@ def calculate_confidence(signal_data):
             + " News=" + state.get('news_sentiment', 'neutral')
             + ". Reply with JSON only."
         )
-
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -346,89 +386,74 @@ def calculate_confidence(signal_data):
             },
             timeout=15
         )
-
         resp_json = resp.json()
         if "content" not in resp_json:
-            log.warning(f"API issue — fallback")
             return _fallback_confidence(signal_data)
 
         text = resp_json["content"][0]["text"].strip()
-        
-        # Extract JSON
         start = text.find("{")
         end = text.rfind("}") + 1
         if start == -1 or end == 0:
             return _fallback_confidence(signal_data)
 
-        import re
         json_str = text[start:end]
         json_str = re.sub(r'[\n\r\t]', ' ', json_str)
         json_str = json_str.encode('ascii', 'ignore').decode('ascii')
-
         result = json.loads(json_str)
         confidence = int(result.get("confidence", 0))
         execute = confidence >= MIN_CONFIDENCE
-
-        log.info(f"Brain: {confidence}% — {'EXECUTE' if execute else 'SKIP'}")
+        log.info(f"🧠 Brain: {confidence}% — {'✅ EXECUTE' if execute else '❌ SKIP'}")
         return {**result, "execute": execute, "confidence": confidence}
 
     except Exception as e:
-        log.warning(f"Confidence error: {e} — fallback")
+        log.warning(f"Confidence error: {e} — using fallback")
         return _fallback_confidence(signal_data)
 
 
 def _fallback_confidence(signal_data):
-    """
-    Calculate confidence from signal strength alone when Claude API fails.
-    This ensures the bot still trades even if AI scoring is unavailable.
-    """
-    buy_signals = signal_data.get('buy_signals', 0)
+    """Calculate confidence from signal math when Claude API fails."""
+    buy_signals  = signal_data.get('buy_signals', 0)
     sell_signals = signal_data.get('sell_signals', 0)
-    rsi = signal_data.get('rsi', 50)
-    adx = signal_data.get('adx', 0)
+    adx          = signal_data.get('adx', 0)
     recommendation = signal_data.get('tv_recommendation', 'NEUTRAL')
-    direction = signal_data.get('direction', 'LONG')
+    direction    = signal_data.get('direction', 'LONG')
 
-    # Base score from indicator consensus
     total = buy_signals + sell_signals
     if total == 0:
         return {"confidence": 0, "execute": False, "reasoning": "No signals", "lesson_if_loss": ""}
 
-    if direction == "LONG":
-        consensus = (buy_signals / total) * 100
-    else:
-        consensus = (sell_signals / total) * 100
+    consensus = (buy_signals / total * 100) if direction == "LONG" else (sell_signals / total * 100)
 
-    # Adjust for recommendation strength
     if recommendation == "STRONG_BUY" and direction == "LONG":
         consensus += 10
     elif recommendation == "STRONG_SELL" and direction == "SHORT":
         consensus += 10
 
-    # Adjust for ADX (trend strength)
     if adx > 40:
         consensus += 8
     elif adx > 25:
         consensus += 4
 
-    # Cap at 95
     confidence = min(int(consensus), 95)
     execute = confidence >= MIN_CONFIDENCE
-
     log.info(f"🧠 Fallback confidence: {confidence}% — {'✅ EXECUTE' if execute else '❌ SKIP'}")
     return {
         "confidence": confidence,
         "execute": execute,
-        "reasoning": f"Fallback scoring: {buy_signals} buy signals, ADX {adx:.1f}",
+        "reasoning": f"Signal math: {buy_signals} buy signals, ADX {adx:.1f}",
         "lesson_if_loss": "Review signal quality"
     }
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  TRADINGVIEW SIGNAL DETECTION
+# ══════════════════════════════════════════════════════════════════════════════
+
 def get_tradingview_analysis(symbol=SYMBOL):
-    """Get full TradingView technical analysis — professional grade signals."""
+    """Get professional grade TradingView analysis."""
     try:
         from tradingview_ta import TA_Handler, Interval
-        # Try multiple exchanges since SPY can appear on different ones
+        analysis = None
         for exchange in ["AMEX", "NYSE", "ARCA"]:
             try:
                 handler = TA_Handler(
@@ -439,33 +464,36 @@ def get_tradingview_analysis(symbol=SYMBOL):
                 )
                 analysis = handler.get_analysis()
                 close_price = analysis.indicators.get("close", 0)
-                # SPY should be between $500-700, reject if way off
-                if symbol == "SPY" and (close_price < 400 or close_price > 800):
-                    log.warning(f"SPY price {close_price} looks wrong on {exchange}, trying next")
+                if symbol == "SPY" and (close_price < 400 or close_price > 900):
+                    log.warning(f"SPY price {close_price} looks wrong on {exchange}")
                     continue
                 log.info(f"✅ TradingView connected via {exchange}")
                 break
             except Exception:
                 continue
+
+        if not analysis:
+            return None
+
         ind = analysis.indicators
         summary = analysis.summary
         return {
             "recommendation": summary.get("RECOMMENDATION", "NEUTRAL"),
-            "buy_signals": summary.get("BUY", 0),
-            "sell_signals": summary.get("SELL", 0),
+            "buy_signals":    summary.get("BUY", 0),
+            "sell_signals":   summary.get("SELL", 0),
             "neutral_signals": summary.get("NEUTRAL", 0),
-            "rsi": ind.get("RSI", 50),
-            "macd": ind.get("MACD.macd", 0),
+            "rsi":         ind.get("RSI", 50),
+            "macd":        ind.get("MACD.macd", 0),
             "macd_signal": ind.get("MACD.signal", 0),
-            "ema20": ind.get("EMA20", 0),
-            "ema50": ind.get("EMA50", 0),
-            "vwap": ind.get("VWAP", 0),
-            "bb_upper": ind.get("BB.upper", 0),
-            "bb_lower": ind.get("BB.lower", 0),
-            "volume": ind.get("volume", 0),
-            "close": ind.get("close", 0),
-            "adx": ind.get("ADX", 0),
-            "stoch_k": ind.get("Stoch.K", 50),
+            "ema20":       ind.get("EMA20", 0),
+            "ema50":       ind.get("EMA50", 0),
+            "vwap":        ind.get("VWAP", 0),
+            "bb_upper":    ind.get("BB.upper", 0),
+            "bb_lower":    ind.get("BB.lower", 0),
+            "volume":      ind.get("volume", 0),
+            "close":       ind.get("close", 0),
+            "adx":         ind.get("ADX", 0),
+            "stoch_k":     ind.get("Stoch.K", 50),
         }
     except ImportError:
         log.warning("tradingview-ta not installed")
@@ -478,7 +506,7 @@ def get_tradingview_analysis(symbol=SYMBOL):
 def calculate_rsi(prices, period=14):
     if len(prices) < period + 1:
         return 50
-    gains = [max(prices[i] - prices[i-1], 0) for i in range(1, len(prices))]
+    gains  = [max(prices[i] - prices[i-1], 0) for i in range(1, len(prices))]
     losses = [max(prices[i-1] - prices[i], 0) for i in range(1, len(prices))]
     avg_gain = sum(gains[-period:]) / period
     avg_loss = sum(losses[-period:]) / period
@@ -503,7 +531,7 @@ def get_bars(symbol=SYMBOL, limit=50):
 
 
 def check_signal():
-    """Check for trading signal using TradingView analysis + Alpaca fallback."""
+    """Check for trading signal — TradingView primary, Alpaca fallback."""
     now = datetime.now(CT)
     hour, minute = now.hour, now.minute
 
@@ -514,24 +542,22 @@ def check_signal():
     if (hour, minute) > (15, 30):
         return None
 
-    # Try TradingView first — much richer data
     tv = get_tradingview_analysis()
 
     if tv and tv["close"] > 0:
         current_price = tv["close"]
-        rsi = tv["rsi"]
-        vwap = tv["vwap"]
+        rsi           = tv["rsi"]
+        vwap          = tv["vwap"]
         recommendation = tv["recommendation"]
-        buy_signals = tv["buy_signals"]
-        sell_signals = tv["sell_signals"]
-        macd = tv["macd"]
-        macd_signal_val = tv["macd_signal"]
-        adx = tv["adx"]
+        buy_signals   = tv["buy_signals"]
+        sell_signals  = tv["sell_signals"]
+        macd          = tv["macd"]
+        macd_sig      = tv["macd_signal"]
+        adx           = tv["adx"]
 
-        # Detect ranging/choppy market — skip if ADX too low
+        # Detect ranging/choppy market
         if adx < 20:
-            log.info(f"📊 RANGING MARKET detected (ADX:{adx:.1f} < 20) — skipping all signals")
-            log.info(f"📊 Choppy market: price bouncing sideways, breakouts unreliable")
+            log.info(f"📊 RANGING MARKET (ADX:{adx:.1f} < 20) — skipping")
             return None
 
         market_type = "TRENDING" if adx > 25 else "WEAK TREND"
@@ -544,7 +570,6 @@ def check_signal():
             rsi > 45 and
             adx > 20
         )
-
         strong_sell = (
             recommendation in ["STRONG_SELL", "SELL"] and
             sell_signals >= 10 and
@@ -553,34 +578,35 @@ def check_signal():
         )
 
         if not (strong_buy or strong_sell):
-            log.info(f"📊 No signal — Buy:{buy_signals} Sell:{sell_signals} RSI:{rsi:.1f} MACD:{'✅' if macd > macd_signal_val else '❌'} ADX:{adx:.1f}")
+            log.info(f"📊 No signal — Buy:{buy_signals} Sell:{sell_signals} "
+                     f"RSI:{rsi:.1f} MACD:{'✅' if macd > macd_sig else '❌'} ADX:{adx:.1f}")
             return None
 
         direction = "LONG" if strong_buy else "SHORT"
-        log.info(f"🔔 {'LONG' if strong_buy else 'SHORT'} signal @ ${current_price:.2f} | RSI:{rsi:.1f} | Buy:{buy_signals} Sell:{sell_signals}")
+        log.info(f"🔔 {direction} signal @ ${current_price:.2f} | RSI:{rsi:.1f} | Buy:{buy_signals} Sell:{sell_signals}")
         return {
-            "symbol": SYMBOL,
-            "strategy": f"TradingView {recommendation}",
-            "direction": direction,
-            "price": current_price,
-            "vwap": round(vwap, 2),
-            "rsi": round(rsi, 1),
-            "volume_ratio": round(tv["volume"] / 1000000, 2),
-            "buy_signals": buy_signals,
-            "sell_signals": sell_signals,
-            "macd": round(macd, 4),
-            "adx": round(adx, 1),
-            "time": now.strftime("%H:%M CT"),
+            "symbol":         SYMBOL,
+            "strategy":       f"TradingView {recommendation}",
+            "direction":      direction,
+            "price":          current_price,
+            "vwap":           round(vwap, 2),
+            "rsi":            round(rsi, 1),
+            "volume_ratio":   round(tv["volume"] / 1000000, 2),
+            "buy_signals":    buy_signals,
+            "sell_signals":   sell_signals,
+            "macd":           round(macd, 4),
+            "adx":            round(adx, 1),
+            "time":           now.strftime("%H:%M CT"),
             "tv_recommendation": recommendation,
         }
 
-    # Fallback: Alpaca VWAP crossover
-    log.info("📊 TradingView unavailable — using Alpaca fallback")
+    # Alpaca VWAP fallback
+    log.info("📊 TradingView unavailable — using Alpaca VWAP fallback")
     bars = get_bars()
     if len(bars) < 20:
         return None
 
-    closes = [b["c"] for b in bars]
+    closes  = [b["c"] for b in bars]
     volumes = [b["v"] for b in bars]
     current_price = closes[-1]
     total_vol = sum(volumes)
@@ -589,65 +615,37 @@ def check_signal():
     avg_vol = sum(volumes[:-1]) / len(volumes[:-1]) if len(volumes) > 1 else 1
     vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 0
     prev_price = closes[-2] if len(closes) >= 2 else current_price
+
     crossed_above = prev_price < vwap and current_price > vwap
     crossed_below = prev_price > vwap and current_price < vwap
     if not (crossed_above or crossed_below):
         return None
     if vol_ratio < 1.3:
         return None
+
     direction = "LONG" if crossed_above else "SHORT"
     return {
-        "symbol": SYMBOL,
-        "strategy": "VWAP Breakout",
-        "direction": direction,
-        "price": current_price,
-        "vwap": round(vwap, 2),
-        "rsi": round(rsi, 1),
+        "symbol":       SYMBOL,
+        "strategy":     "VWAP Breakout",
+        "direction":    direction,
+        "price":        current_price,
+        "vwap":         round(vwap, 2),
+        "rsi":          round(rsi, 1),
         "volume_ratio": round(vol_ratio, 2),
-        "time": now.strftime("%H:%M CT"),
+        "time":         now.strftime("%H:%M CT"),
     }
 
 
-def log_trade_to_brain(trade_data, outcome):
-    """Log completed trade to brain for learning."""
-    now = datetime.now(CT)
-    folder = "trading-brain/Successes" if outcome == "WIN" else "trading-brain/Failures"
-    os.makedirs(folder, exist_ok=True)
-    filename = f"{folder}/{'success' if outcome == 'WIN' else 'failure'}_{now.strftime('%Y%m%d_%H%M%S')}.md"
-    icon = "✅" if outcome == "WIN" else "❌"
-    simple_content = f"""# {icon} {outcome} — {now.strftime('%Y-%m-%d %H:%M CT')}
-## Trade Details
-- Direction: {trade_data.get('direction', 'N/A')}
-- Entry: ${trade_data.get('entry_price', 0):.2f}
-- Exit: ${trade_data.get('exit_price', 0):.2f}
-- P&L: ${trade_data.get('pnl', 0):.2f}
-- Confidence: {trade_data.get('confidence', 0)}%
-- RSI: {trade_data.get('rsi', 'N/A')}
-- ADX: {trade_data.get('adx', 'N/A')}
-- Time: {trade_data.get('time', 'N/A')}
-
-## Lesson
-{trade_data.get('lesson', 'Review this trade.')}
-"""
-    with open(filename, "w") as f:
-        f.write(simple_content)
-    log.info(f"🧠 Trade logged: {filename}")
-
-    if BRAIN_WRITER_AVAILABLE:
-        try:
-            write_trade_analysis(trade_data, outcome,
-                                 state.get('news_sentiment', 'neutral'),
-                                 state.get('news_score', 50))
-        except Exception as e:
-            log.warning(f"Brain writer error: {e}")
-
+# ══════════════════════════════════════════════════════════════════════════════
+#  RISK & ALERTS
+# ══════════════════════════════════════════════════════════════════════════════
 
 def check_risk_limits():
     if state["trades_today"] >= MAX_TRADES_PER_DAY:
-        log.warning(f"⛔ Max trades reached")
+        log.warning("⛔ Max trades reached")
         return False
     if state["daily_pnl"] <= -MAX_DAILY_LOSS:
-        log.warning(f"⛔ Daily loss limit hit")
+        log.warning("⛔ Daily loss limit hit")
         send_alert(f"⛔ Daily loss limit! P&L: ${state['daily_pnl']:.2f}")
         return False
     return True
@@ -660,7 +658,7 @@ def send_alert(message):
     try:
         requests.post("https://api.pushover.net/1/messages.json", data={
             "token": PUSHOVER_TOKEN,
-            "user": PUSHOVER_USER,
+            "user":  PUSHOVER_USER,
             "message": message,
             "title": "🤖 Trading Bot"
         }, timeout=10)
@@ -668,13 +666,17 @@ def send_alert(message):
         log.error(f"Alert error: {e}")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  DAILY ROUTINES
+# ══════════════════════════════════════════════════════════════════════════════
+
 def pre_market_routine():
     log.info("=" * 60)
     log.info("🌅 PRE-MARKET STARTING")
     state["trades_today"] = 0
-    state["daily_pnl"] = 0.0
-    state["skip_day"] = False
-    state["trade_log"] = []
+    state["daily_pnl"]    = 0.0
+    state["skip_day"]     = False
+    state["trade_log"]    = []
     load_brain()
     check_news_and_calendar()
     if not state["skip_day"]:
@@ -688,12 +690,12 @@ def monitor_position():
     if not current_price:
         return
 
-    pos = state["position"]
+    pos       = state["position"]
     direction = pos["direction"]
-    hit_target = (direction == "LONG" and current_price >= pos["target_price"]) or \
+    hit_target = (direction == "LONG"  and current_price >= pos["target_price"]) or \
                  (direction == "SHORT" and current_price <= pos["target_price"])
-    hit_stop = (direction == "LONG" and current_price <= pos["stop_price"]) or \
-               (direction == "SHORT" and current_price >= pos["stop_price"])
+    hit_stop   = (direction == "LONG"  and current_price <= pos["stop_price"])  or \
+                 (direction == "SHORT" and current_price >= pos["stop_price"])
 
     if hit_target or hit_stop:
         outcome = "WIN" if hit_target else "LOSS"
@@ -709,8 +711,8 @@ def monitor_position():
         log_trade_to_brain({
             **pos,
             "exit_price": current_price,
-            "pnl": pnl,
-            "lesson": pos.get("lesson_if_loss", "") if outcome == "LOSS" else "Replicate this setup."
+            "pnl":        pnl,
+            "lesson":     pos.get("lesson_if_loss", "") if outcome == "LOSS" else "Replicate this setup."
         }, outcome)
 
 
@@ -731,8 +733,8 @@ def trading_loop():
         return
 
     log.info(f"🔔 Signal: {signal['strategy']} {signal['direction']} @ ${signal['price']:.2f}")
-
     brain_result = calculate_confidence(signal)
+
     if not brain_result["execute"]:
         log.info(f"⏭️  Skipped — {brain_result['confidence']}% confidence")
         return
@@ -745,10 +747,10 @@ def trading_loop():
         offset = signal["price"] * 0.002
         state["position"] = {
             **signal,
-            "entry_price": signal["price"],
-            "confidence": brain_result["confidence"],
+            "entry_price":    signal["price"],
+            "confidence":     brain_result["confidence"],
             "lesson_if_loss": brain_result.get("lesson_if_loss", ""),
-            "stop_price": signal["price"] - offset if signal["direction"] == "LONG" else signal["price"] + offset,
+            "stop_price":   signal["price"] - offset if signal["direction"] == "LONG" else signal["price"] + offset,
             "target_price": signal["price"] + offset * 2 if signal["direction"] == "LONG" else signal["price"] - offset * 2,
         }
         state["trades_today"] += 1
@@ -756,32 +758,29 @@ def trading_loop():
 
 def end_of_day():
     log.info("🚪 END OF DAY — Closing all positions")
-    
-    # Close tracked position
     if state["position"]:
-        symbol = state["position"]["symbol"]
-        log.info(f"Closing tracked position: {symbol}")
-        close_position(symbol)
-    
-    # Also force-close any open positions on Alpaca directly
+        close_position(state["position"]["symbol"])
     try:
         resp = requests.delete(
             f"{ALPACA_BASE_URL}/positions",
-            headers=alpaca_headers(),
-            timeout=10
+            headers=alpaca_headers(), timeout=10
         )
         if resp.status_code in [200, 204, 207]:
             log.info("✅ All Alpaca positions closed")
         else:
             log.warning(f"Position close response: {resp.status_code}")
     except Exception as e:
-        log.error(f"Error closing all positions: {e}")
+        log.error(f"Error closing positions: {e}")
 
     summary = f"📊 Day done! P&L: ${state['daily_pnl']:.2f} | Trades: {state['trades_today']}"
     send_alert(summary)
     log.info(summary)
     log.info("=" * 60)
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════════════════
 
 def run_bot():
     log.info("🤖 TRADING BOT STARTING UP")
@@ -809,6 +808,3 @@ def run_bot():
 
 if __name__ == "__main__":
     run_bot()
-
-
-
